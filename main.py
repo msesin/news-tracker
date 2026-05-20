@@ -2,6 +2,7 @@ import asyncio
 from telethon import TelegramClient, events
 from config import TELEGRAM_API_ID, TELEGRAM_API_HASH
 from channels import CHANNELS
+from filters import keyword_match
 
 SESSION_FILE = "news_tracker"
 
@@ -34,10 +35,18 @@ async def main():
         channel_name = channel_map.get(event.chat_id, str(event.chat_id))
         text = (event.raw_text or "").strip()
         preview = text[:120].replace("\n", " ")
-        print(f"[{channel_name}] {preview}")
+        result = "PASS" if keyword_match(text) else "SKIP"
+        print(f"[{result}] [{channel_name}] {preview}")
 
     await client.run_until_disconnected()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(main())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        loop.close()
