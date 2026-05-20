@@ -1,2 +1,8 @@
-# List of Telegram channels to monitor — populated in Phase 2
-CHANNELS = []
+CHANNELS = [
+    {"name": "Suspilne",          "username": "suspilnenews"},
+    {"name": "Interfax Ukraine",  "username": "interfax_uk"},
+    {"name": "MP Zheleznyak",     "username": "yzheleznyak"},
+    {"name": "Law Press",         "username": "sudua"},
+    {"name": "MP Melnychuk",      "username": "tmelnychuk"},
+    {"name": "Lawyer Lihachev",   "username": "advokatRomanLihachev"},
+]
