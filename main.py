@@ -2,7 +2,8 @@ import asyncio
 from telethon import TelegramClient, events
 from config import TELEGRAM_API_ID, TELEGRAM_API_HASH
 from channels import CHANNELS
-from filters import keyword_match
+from filters import keyword_match, llm_classify
+from storage import init_db, log_decision
 
 SESSION_FILE = "news_tracker"
 
@@ -10,7 +11,6 @@ client = TelegramClient(SESSION_FILE, TELEGRAM_API_ID, TELEGRAM_API_HASH)
 
 
 async def resolve_channels():
-    """Return a dict of {entity_id: channel_name} for all configured channels."""
     resolved = {}
     for ch in CHANNELS:
         try:
@@ -23,6 +23,8 @@ async def resolve_channels():
 
 
 async def main():
+    init_db()
+
     await client.start()
     print("\nLogged in successfully.\n")
 
@@ -30,13 +32,26 @@ async def main():
     channel_map = await resolve_channels()
     print(f"\nMonitoring {len(channel_map)} channel(s). Waiting for new messages...\n")
 
+    loop = asyncio.get_event_loop()
+
     @client.on(events.NewMessage(chats=list(channel_map.keys())))
     async def handler(event):
         channel_name = channel_map.get(event.chat_id, str(event.chat_id))
         text = (event.raw_text or "").strip()
         preview = text[:120].replace("\n", " ")
-        result = "PASS" if keyword_match(text) else "SKIP"
-        print(f"[{result}] [{channel_name}] {preview}")
+
+        if not keyword_match(text):
+            print(f"[SKIP] [{channel_name}] {preview}")
+            return
+
+        # Run the blocking Gemini call in a thread so the event loop stays responsive
+        decision, reason = await loop.run_in_executor(
+            None, llm_classify, text, channel_name
+        )
+        log_decision(channel_name, text, decision, reason)
+
+        label = "YES " if decision else "NO  "
+        print(f"[{label}] [{channel_name}] {reason} | {preview}")
 
     await client.run_until_disconnected()
 
