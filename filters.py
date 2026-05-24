@@ -1,7 +1,14 @@
+import time
+import threading
 from google import genai
 from config import LLM_API_KEY
 
 _client = genai.Client(api_key=LLM_API_KEY)
+
+# Rate limiter: free tier allows 15 RPM → enforce min 4s between calls
+_lock = threading.Lock()
+_last_call_time = 0.0
+_MIN_INTERVAL = 4.0
 
 KEYWORDS = [
     # Age ranges
@@ -23,8 +30,6 @@ KEYWORDS = [
     "указ президента",
     # English terms (for forwarded content)
     "mobilization", "conscription", "draft exemption", "border crossing",
-    # Random string of keywords to catch more variations
-    "атак", "війна", "росія", "агресор", "окупант", "захід", "путін", "російськ", "президент", "економіка", "обстірл", "обстріл", "РФ", "метро", "робот",
 ]
 
 _PROMPT_TEMPLATE = """\
@@ -63,12 +68,32 @@ def keyword_match(text: str) -> bool:
 
 
 def llm_classify(text: str, channel: str) -> tuple[bool, str]:
+    global _last_call_time
     prompt = _PROMPT_TEMPLATE.format(channel=channel, text=text[:2000])
-    try:
-        response = _client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
-        lines = response.text.strip().splitlines()
-        decision = lines[0].strip().upper().startswith("YES")
-        reason = lines[1].strip() if len(lines) > 1 else "(no reason)"
-        return decision, reason
-    except Exception as e:
-        return False, f"LLM error: {e}"
+
+    # Enforce minimum interval between calls to stay under 15 RPM
+    with _lock:
+        now = time.time()
+        wait = _MIN_INTERVAL - (now - _last_call_time)
+        if wait > 0:
+            time.sleep(wait)
+        _last_call_time = time.time()
+
+    for attempt in range(3):
+        try:
+            response = _client.models.generate_content(
+                model="gemini-2.0-flash", contents=prompt
+            )
+            lines = response.text.strip().splitlines()
+            decision = lines[0].strip().upper().startswith("YES")
+            reason = lines[1].strip() if len(lines) > 1 else "(no reason)"
+            return decision, reason
+        except Exception as e:
+            if "429" in str(e) and attempt < 2:
+                wait_time = 60 * (attempt + 1)
+                print(f"[WAIT] rate limited, retrying in {wait_time}s...")
+                time.sleep(wait_time)
+                continue
+            return False, f"LLM error: {e}"
+
+    return False, "LLM error: max retries exceeded"
