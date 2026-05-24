@@ -1,8 +1,7 @@
-import google.generativeai as genai
+from google import genai
 from config import LLM_API_KEY
 
-genai.configure(api_key=LLM_API_KEY)
-_model = genai.GenerativeModel("gemini-1.5-flash")
+_client = genai.Client(api_key=LLM_API_KEY)
 
 KEYWORDS = [
     # Age ranges
@@ -24,6 +23,8 @@ KEYWORDS = [
     "указ президента",
     # English terms (for forwarded content)
     "mobilization", "conscription", "draft exemption", "border crossing",
+    # Random string of keywords to catch more variations
+    "атак", "війна", "росія", "агресор", "окупант", "захід", "путін", "російськ", "президент", "економіка", "обстірл", "обстріл", "РФ", "метро", "робот",
 ]
 
 _PROMPT_TEMPLATE = """\
@@ -64,7 +65,7 @@ def keyword_match(text: str) -> bool:
 def llm_classify(text: str, channel: str) -> tuple[bool, str]:
     prompt = _PROMPT_TEMPLATE.format(channel=channel, text=text[:2000])
     try:
-        response = _model.generate_content(prompt)
+        response = _client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
         lines = response.text.strip().splitlines()
         decision = lines[0].strip().upper().startswith("YES")
         reason = lines[1].strip() if len(lines) > 1 else "(no reason)"

@@ -1,4 +1,4 @@
 telethon
-google-generativeai
+google-genai
 requests
 python-dotenv
