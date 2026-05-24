@@ -2,7 +2,7 @@ import google.generativeai as genai
 from config import LLM_API_KEY
 
 genai.configure(api_key=LLM_API_KEY)
-_model = genai.GenerativeModel("gemini-2.0-flash")
+_model = genai.GenerativeModel("gemini-1.5-flash")
 
 KEYWORDS = [
     # Age ranges
@@ -33,7 +33,8 @@ in Ukrainian military mobilization rules that specifically affect men aged 18–
 A post is relevant (YES) if it discusses:
 - New or changed laws, decrees, or court rulings about mobilization, conscription, \
 or draft exemptions for men aged 18–22 (or overlapping brackets that include this group)
-- Changes to rules about crossing the Ukrainian border for men of military age
+- Changes to rules about crossing the Ukrainian border for men aged 18–22
+- Changes to БЗВП rules affecting men 18-22
 - New deferral or exemption categories that apply to young men aged 18–22
 - Official announcements from the Ministry of Defense, TCC (ТЦК), or the President \
 specifically about mobilization age brackets
@@ -49,7 +50,7 @@ Channel: {channel}
 Post text:
 {text}
 
-Respond with exactly two lines:
+Respond with exactly two lines answering the main question "Does this post describe a change to exit-abroad rules, mobilization rules, or military obligations for Ukrainian men aged 18–22?" in the following format:
 Line 1: YES or NO
 Line 2: One sentence explaining why (in English)
 """
