@@ -38,7 +38,7 @@ async def daily_heartbeat(loop: asyncio.AbstractEventLoop) -> None:
             target += timedelta(days=1)
 
         wait_secs = (target - now).total_seconds()
-        print(f"[HEARTBEAT] next check at 21:00 Kyiv ({wait_secs / 3600:.1f}h from now)")
+        print(f"[HEARTBEAT] next check at {target.strftime('%H:%M')} Kyiv ({wait_secs / 3600:.1f}h from now)")
         await asyncio.sleep(wait_secs)
 
         if not has_yes_today():
