@@ -1,10 +1,14 @@
 import asyncio
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from telethon import TelegramClient, events
 from config import TELEGRAM_API_ID, TELEGRAM_API_HASH
 from channels import CHANNELS
 from filters import keyword_match, llm_classify
-from storage import init_db, log_decision, is_duplicate, mark_seen
-from notifier import send_notification
+from storage import init_db, log_decision, is_duplicate, mark_seen, has_yes_today
+from notifier import send_notification, send_text
+
+_KYIV = ZoneInfo("Europe/Kyiv")
 
 SESSION_FILE = "news_tracker"
 
@@ -24,6 +28,31 @@ async def resolve_channels():
     return resolved
 
 
+async def daily_heartbeat(loop: asyncio.AbstractEventLoop) -> None:
+    """At 21:00 Kyiv time, send 'no updates' if nothing relevant was found today."""
+    while True:
+        now = datetime.now(_KYIV)
+        target = now.replace(hour=21, minute=0, second=0, microsecond=0)
+        if now >= target:
+            from datetime import timedelta
+            target += timedelta(days=1)
+
+        wait_secs = (target - now).total_seconds()
+        print(f"[HEARTBEAT] next check at 21:00 Kyiv ({wait_secs / 3600:.1f}h from now)")
+        await asyncio.sleep(wait_secs)
+
+        if not has_yes_today():
+            try:
+                await loop.run_in_executor(
+                    None, send_text, "No relevant updates today."
+                )
+                print("[HEARTBEAT] sent 'no updates' message")
+            except Exception as e:
+                print(f"[HEARTBEAT] failed to send: {e}")
+        else:
+            print("[HEARTBEAT] relevant updates were sent today — skipping digest")
+
+
 async def main():
     init_db()
 
@@ -35,6 +64,7 @@ async def main():
     print(f"\nMonitoring {len(channel_map)} channel(s). Waiting for new messages...\n")
 
     loop = asyncio.get_event_loop()
+    asyncio.create_task(daily_heartbeat(loop))
 
     @client.on(events.NewMessage(chats=list(channel_map.keys())))
     async def handler(event):

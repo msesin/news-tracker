@@ -1,6 +1,9 @@
 import hashlib
 import sqlite3
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
+_KYIV = ZoneInfo("Europe/Kyiv")
 
 DB_PATH = "decisions.db"
 
@@ -62,3 +65,19 @@ def mark_seen(text: str):
             "INSERT OR REPLACE INTO seen_posts (hash, timestamp) VALUES (?, datetime('now'))",
             (h,),
         )
+
+
+def has_yes_today() -> bool:
+    """Return True if any YES decision was logged since midnight Kyiv time today."""
+    midnight_kyiv = (
+        datetime.now(_KYIV)
+        .replace(hour=0, minute=0, second=0, microsecond=0)
+        .astimezone(timezone.utc)
+        .isoformat()
+    )
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM decisions WHERE llm_decision='YES' AND timestamp >= ? LIMIT 1",
+            (midnight_kyiv,),
+        ).fetchone()
+    return row is not None

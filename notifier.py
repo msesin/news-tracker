@@ -30,3 +30,12 @@ def send_notification(
         timeout=10,
     )
     resp.raise_for_status()
+
+
+def send_text(message: str) -> None:
+    resp = requests.post(
+        _API,
+        json={"chat_id": TELEGRAM_CHAT_ID, "text": message},
+        timeout=10,
+    )
+    resp.raise_for_status()
