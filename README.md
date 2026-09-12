@@ -46,7 +46,7 @@ but "it died quietly and nobody noticed." Two independent layers cover that:
 | Layer | Catches | How you find out |
 |---|---|---|
 | **[healthchecks.io](https://healthchecks.io) dead man's switch** | Server offline, network down, process hung, event loop stuck | The process checks in every 5 minutes. If check-ins stop, healthchecks.io (external infrastructure) messages you. |
-| **systemd `OnFailure=`** | Process crashed while the server is still up | [`alert_failure.py`](alert_failure.py) DMs you the cause, then re-checks 15 minutes later and reports whether it recovered on its own. |
+| **systemd `ExecStopPost=`** | Process crashed while the server is still up | [`alert_failure.py`](alert_failure.py) DMs you the cause immediately. Recovery is then reported by the healthchecks.io ping resuming (Layer 1's native "up" notification), rather than a second script — a crash-and-immediate-restart cycle otherwise never passes through systemd's "failed" state, so `OnFailure=` alone misses it. |
 
 The first layer is the important one: a heartbeat *sent by* the app can never report the
 app's own death. Inverting it — the app checks in, and something external notices silence
@@ -67,7 +67,7 @@ public channel.
 | [`filters.py`](filters.py) | Keyword list, Gemini prompt, rate limiter |
 | [`storage.py`](storage.py) | SQLite decision log and 24h deduplication |
 | [`notifier.py`](notifier.py) | Sends channel posts and alert DMs |
-| [`alert_failure.py`](alert_failure.py) | Failure alert with follow-up, run by systemd |
+| [`alert_failure.py`](alert_failure.py) | Failure alert, run by systemd on every non-clean stop |
 | [`selftest.py`](selftest.py) | Pre-deploy checks for config, bots, and delivery |
 | [`deploy/`](deploy/) | systemd unit files |
 
@@ -139,7 +139,7 @@ python main.py
 Copy the unit files, then enable the service:
 
 ```bash
-sudo cp deploy/news-tracker.service deploy/news-tracker-alert@.service /etc/systemd/system/
+sudo cp deploy/news-tracker.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now news-tracker
 systemctl status news-tracker
@@ -150,8 +150,9 @@ The unit files assume the project lives at `/home/ubuntu/news-tracker` and runs 
 `ubuntu`; adjust `User`, `WorkingDirectory`, and `ExecStart` if yours differs. `-u` on
 `ExecStart` keeps Python's output unbuffered so logs reach the journal immediately.
 
-The alert unit needs permission to read the journal — on Ubuntu the default user is
-already in the `adm` group, which grants it.
+`alert_failure.py` needs permission to read the journal — on Ubuntu the default user is
+already in the `adm` group, which grants it. It only sends a message when the stop was
+not a deliberate `systemctl stop` (checked via systemd's `$SERVICE_RESULT`).
 
 ## Updating
 
@@ -177,5 +178,5 @@ untouched.
 | `LLM_API_KEY` | Google Gemini API key |
 
 Tuning knobs live at the top of their modules: `KEYWORDS` and the prompt in
-`filters.py`, `PING_INTERVAL` in `main.py`, `FOLLOWUP_DELAY` in `alert_failure.py`,
+`filters.py`, `PING_INTERVAL` in `main.py`,
 and the monitored channel list in `channels.py`.

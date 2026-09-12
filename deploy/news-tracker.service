@@ -1,13 +1,13 @@
 [Unit]
 Description=News Tracker
 After=network.target
-OnFailure=news-tracker-alert@%n.service
 
 [Service]
 Type=simple
 User=ubuntu
 WorkingDirectory=/home/ubuntu/news-tracker
 ExecStart=/home/ubuntu/news-tracker/.venv/bin/python -u main.py
+ExecStopPost=/home/ubuntu/news-tracker/.venv/bin/python -u /home/ubuntu/news-tracker/alert_failure.py news-tracker.service
 Restart=on-failure
 RestartSec=5
 
