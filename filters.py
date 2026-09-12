@@ -3,12 +3,14 @@ import threading
 from google import genai
 from config import LLM_API_KEY
 
+_MODEL = "gemini-3.1-flash-lite"
 _client = genai.Client(api_key=LLM_API_KEY)
+print(f"[LLM] key={LLM_API_KEY[:8]}… model={_MODEL}")
 
-# Rate limiter: free tier allows 15 RPM → enforce min 4s between calls
+# Rate limiter: free tier = 15 RPM; 5 s gap → 12 RPM to avoid edge-of-window 429s
 _lock = threading.Lock()
 _last_call_time = 0.0
-_MIN_INTERVAL = 4.0
+_MIN_INTERVAL = 5.0
 
 KEYWORDS = [
     # Age ranges
@@ -73,16 +75,16 @@ def llm_classify(text: str, channel: str) -> tuple[bool, str]:
 
     # Enforce minimum interval between calls to stay under 15 RPM
     with _lock:
-        now = time.time()
+        now = time.monotonic()
         wait = _MIN_INTERVAL - (now - _last_call_time)
         if wait > 0:
             time.sleep(wait)
-        _last_call_time = time.time()
+        _last_call_time = time.monotonic()
 
     for attempt in range(3):
         try:
             response = _client.models.generate_content(
-                model="gemini-2.0-flash", contents=prompt
+                model=_MODEL, contents=prompt
             )
             lines = response.text.strip().splitlines()
             decision = lines[0].strip().upper().startswith("YES")
