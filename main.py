@@ -1,56 +1,46 @@
 import asyncio
-from datetime import datetime
-from zoneinfo import ZoneInfo
-from telethon import TelegramClient, events
-from config import TELEGRAM_API_ID, TELEGRAM_API_HASH
+import requests
+from telethon import TelegramClient, events, utils
+from config import TELEGRAM_API_ID, TELEGRAM_API_HASH, HEALTHCHECK_URL
 from channels import CHANNELS
 from filters import keyword_match, llm_classify
-from storage import init_db, log_decision, is_duplicate, mark_seen, has_yes_today
-from notifier import send_notification, send_text
-
-_KYIV = ZoneInfo("Europe/Kyiv")
+from storage import init_db, log_decision, is_duplicate, mark_seen
+from notifier import send_notification, send_alert
 
 SESSION_FILE = "news_tracker"
+PING_INTERVAL = 300
 
 client = TelegramClient(SESSION_FILE, TELEGRAM_API_ID, TELEGRAM_API_HASH)
 
 
 async def resolve_channels():
-    # Returns {entity_id: {"name": ..., "username": ...}}
+    # Keyed by the marked peer id (-100…) so lookups by event.chat_id match.
     resolved = {}
     for ch in CHANNELS:
         try:
             entity = await client.get_entity(ch["username"])
-            resolved[entity.id] = {"name": ch["name"], "username": ch["username"]}
-            print(f"  OK  {ch['name']:25s}  id={entity.id}  @{ch['username']}")
+            peer_id = utils.get_peer_id(entity)
+            resolved[peer_id] = {"name": ch["name"], "username": ch["username"]}
+            print(f"  OK  {ch['name']:25s}  id={peer_id}  @{ch['username']}")
         except Exception as e:
             print(f"  FAIL  {ch['name']:25s}  @{ch['username']}  — {e}")
     return resolved
 
 
-async def daily_heartbeat(loop: asyncio.AbstractEventLoop) -> None:
-    """At 21:00 Kyiv time, send 'no updates' if nothing relevant was found today."""
+async def healthcheck_ping(loop: asyncio.AbstractEventLoop) -> None:
+    """Check in to healthchecks.io — skipped while Telegram is down, so a
+    silently disconnected client trips the alarm instead of looking healthy."""
     while True:
-        now = datetime.now(_KYIV)
-        target = now.replace(hour=21, minute=0, second=0, microsecond=0)
-        if now >= target:
-            from datetime import timedelta
-            target += timedelta(days=1)
-
-        wait_secs = (target - now).total_seconds()
-        print(f"[HEARTBEAT] next check at {target.strftime('%H:%M')} Kyiv ({wait_secs / 3600:.1f}h from now)")
-        await asyncio.sleep(wait_secs)
-
-        if not has_yes_today():
+        if client.is_connected():
             try:
                 await loop.run_in_executor(
-                    None, send_text, "No relevant updates today."
+                    None, lambda: requests.get(HEALTHCHECK_URL, timeout=10)
                 )
-                print("[HEARTBEAT] sent 'no updates' message")
             except Exception as e:
-                print(f"[HEARTBEAT] failed to send: {e}")
+                print(f"[PING] failed to reach healthchecks.io: {e}")
         else:
-            print("[HEARTBEAT] relevant updates were sent today — skipping digest")
+            print("[PING] skipped — Telegram client disconnected")
+        await asyncio.sleep(PING_INTERVAL)
 
 
 async def main():
@@ -64,7 +54,7 @@ async def main():
     print(f"\nMonitoring {len(channel_map)} channel(s). Waiting for new messages...\n")
 
     loop = asyncio.get_event_loop()
-    asyncio.create_task(daily_heartbeat(loop))
+    asyncio.create_task(healthcheck_ping(loop))
 
     @client.on(events.NewMessage(chats=list(channel_map.keys())))
     async def handler(event):
@@ -108,6 +98,20 @@ async def main():
             print(f"[SENT] [{channel_name}] notification delivered")
         except Exception as e:
             print(f"[ERR ] [{channel_name}] notification failed: {e}")
+            try:
+                await loop.run_in_executor(
+                    None,
+                    send_alert,
+                    f"⚠️ One update may have been missed\n\n"
+                    f"The tracker found a relevant post but could not publish it "
+                    f"to the channel. Open the link below to read it yourself.\n\n"
+                    f"Source: {channel_name}\n"
+                    f"Post: https://t.me/{username}/{event.id}\n\n"
+                    f"Monitoring is still running — nothing else is broken.\n\n"
+                    f"Details: {e}",
+                )
+            except Exception as alert_error:
+                print(f"[ERR ] alert delivery also failed: {alert_error}")
 
     await client.run_until_disconnected()
 

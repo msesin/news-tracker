@@ -1,3 +1,4 @@
+import re
 import time
 import threading
 from google import genai
@@ -11,6 +12,7 @@ print(f"[LLM] key={LLM_API_KEY[:8]}… model={_MODEL}")
 _lock = threading.Lock()
 _last_call_time = 0.0
 _MIN_INTERVAL = 5.0
+_LABEL_RE = re.compile(r"^\s*line\s*\d+\s*:\s*", re.I)
 
 KEYWORDS = [
     # Age ranges
@@ -58,9 +60,12 @@ Channel: {channel}
 Post text:
 {text}
 
-Respond with exactly two lines answering the main question "Does this post describe a change to exit-abroad rules, mobilization rules, or military obligations for Ukrainian men aged 18–22?" in the following format:
-Line 1: YES or NO
-Line 2: One sentence explaining why (in English)
+Answer this question: "Does this post describe a change to exit-abroad rules, \
+mobilization rules, or military obligations for Ukrainian men aged 18–22?"
+
+Respond with exactly two lines, with no labels, numbering, or prefixes:
+the first line is only the word YES or NO, and the second line is one sentence \
+in English explaining why.
 """
 
 
@@ -87,8 +92,11 @@ def llm_classify(text: str, channel: str) -> tuple[bool, str]:
                 model=_MODEL, contents=prompt
             )
             lines = response.text.strip().splitlines()
-            decision = lines[0].strip().upper().startswith("YES")
-            reason = lines[1].strip() if len(lines) > 1 else "(no reason)"
+            # The model intermittently echoes a "Line 1:"/"Line 2:" prefix; without
+            # stripping it a YES parses as NO and the alert is silently dropped.
+            verdict = _LABEL_RE.sub("", lines[0]).strip().upper()
+            decision = verdict.startswith("YES")
+            reason = _LABEL_RE.sub("", lines[1]).strip() if len(lines) > 1 else "(no reason)"
             return decision, reason
         except Exception as e:
             if "429" in str(e) and attempt < 2:

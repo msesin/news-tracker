@@ -1,9 +1,15 @@
 import html
 import requests
 from datetime import datetime
-from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+from config import (
+    NEWS_BOT_TOKEN,
+    NEWS_CHAT_ID,
+    ALERT_BOT_TOKEN,
+    ALERT_CHAT_ID,
+)
 
-_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+_API = f"https://api.telegram.org/bot{NEWS_BOT_TOKEN}/sendMessage"
+_ALERT_API = f"https://api.telegram.org/bot{ALERT_BOT_TOKEN}/sendMessage"
 
 
 def send_notification(
@@ -26,7 +32,7 @@ def send_notification(
 
     resp = requests.post(
         _API,
-        json={"chat_id": TELEGRAM_CHAT_ID, "text": body, "parse_mode": "HTML"},
+        json={"chat_id": NEWS_CHAT_ID, "text": body, "parse_mode": "HTML"},
         timeout=10,
     )
     resp.raise_for_status()
@@ -35,7 +41,16 @@ def send_notification(
 def send_text(message: str) -> None:
     resp = requests.post(
         _API,
-        json={"chat_id": TELEGRAM_CHAT_ID, "text": message},
+        json={"chat_id": NEWS_CHAT_ID, "text": message},
+        timeout=10,
+    )
+    resp.raise_for_status()
+
+
+def send_alert(message: str) -> None:
+    resp = requests.post(
+        _ALERT_API,
+        json={"chat_id": ALERT_CHAT_ID, "text": message},
         timeout=10,
     )
     resp.raise_for_status()
