@@ -46,7 +46,7 @@ but "it died quietly and nobody noticed." Two independent layers cover that:
 | Layer | Catches | How you find out |
 |---|---|---|
 | **[healthchecks.io](https://healthchecks.io) dead man's switch** | Server offline, network down, process hung, event loop stuck | The process checks in every 5 minutes. If check-ins stop, healthchecks.io (external infrastructure) messages you. |
-| **systemd `ExecStopPost=`** | Process crashed while the server is still up | [`alert_failure.py`](alert_failure.py) DMs you the cause immediately. Recovery is then reported by the healthchecks.io ping resuming (Layer 1's native "up" notification), rather than a second script — a crash-and-immediate-restart cycle otherwise never passes through systemd's "failed" state, so `OnFailure=` alone misses it. |
+| **systemd `ExecStopPost=`** | Process crashed while the server is still up | [`alert_failure.py`](alert_failure.py) DMs you the cause immediately and writes a marker file. On its next successful start, `main.py` sees the marker and sends its own "back up" confirmation — a crash-and-restart is typically over in seconds, far faster than healthchecks.io's ~15 min detection window, so recovery can't wait on Layer 1 for this case. |
 
 The first layer is the important one: a heartbeat *sent by* the app can never report the
 app's own death. Inverting it — the app checks in, and something external notices silence

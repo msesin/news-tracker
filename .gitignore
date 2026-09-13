@@ -7,3 +7,4 @@ decisions.db
 .DS_Store
 .vscode/
 news-tracker.code-workspace
+.last_failure

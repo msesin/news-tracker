@@ -50,7 +50,8 @@ def send_text(message: str) -> None:
 def send_alert(message: str) -> None:
     resp = requests.post(
         _ALERT_API,
-        json={"chat_id": ALERT_CHAT_ID, "text": message},
+        json={"chat_id": ALERT_CHAT_ID, "text": message, "parse_mode": "HTML",
+              "disable_web_page_preview": True},
         timeout=10,
     )
     resp.raise_for_status()

@@ -1,4 +1,6 @@
 import asyncio
+import html
+import os
 import requests
 from telethon import TelegramClient, events, utils
 from config import TELEGRAM_API_ID, TELEGRAM_API_HASH, HEALTHCHECK_URL
@@ -6,6 +8,8 @@ from channels import CHANNELS
 from filters import keyword_match, llm_classify
 from storage import init_db, log_decision, is_duplicate, mark_seen
 from notifier import send_notification, send_alert
+
+_FAILURE_MARKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".last_failure")
 
 SESSION_FILE = "news_tracker"
 PING_INTERVAL = 300
@@ -48,6 +52,24 @@ async def main():
 
     await client.start()
     print("\nLogged in successfully.\n")
+
+    # If the last run ended in a real failure (written by alert_failure.py),
+    # confirm recovery now instead of waiting on healthchecks.io, which
+    # won't notice a crash-and-restart faster than its detection window.
+    if os.path.exists(_FAILURE_MARKER):
+        with open(_FAILURE_MARKER) as f:
+            cause = f.read().strip()
+        os.remove(_FAILURE_MARKER)
+        try:
+            send_alert(
+                f"🟢 <b>News tracker is back</b>\n\n"
+                f"It recovered from an earlier problem ({html.escape(cause)}) and is "
+                f"watching the news channels again. You will receive "
+                f"mobilization updates as normal.\n\n"
+                f"<b>Nothing for you to do.</b>"
+            )
+        except Exception as e:
+            print(f"[RECOVERY] failed to send recovery alert: {e}")
 
     print("Resolving channels...")
     channel_map = await resolve_channels()
@@ -102,13 +124,13 @@ async def main():
                 await loop.run_in_executor(
                     None,
                     send_alert,
-                    f"⚠️ One update may have been missed\n\n"
+                    f"⚠️ <b>One update may have been missed</b>\n\n"
                     f"The tracker found a relevant post but could not publish it "
                     f"to the channel. Open the link below to read it yourself.\n\n"
-                    f"Source: {channel_name}\n"
+                    f"Source: {html.escape(channel_name)}\n"
                     f"Post: https://t.me/{username}/{event.id}\n\n"
                     f"Monitoring is still running — nothing else is broken.\n\n"
-                    f"Details: {e}",
+                    f"Details: {html.escape(str(e))}",
                 )
             except Exception as alert_error:
                 print(f"[ERR ] alert delivery also failed: {alert_error}")
