@@ -59,6 +59,17 @@ but silently disconnected from Telegram still trips the alarm instead of looking
 Alerts go to a **separate bot** in a private DM, keeping operational noise out of the
 public channel.
 
+## Alert reference
+
+| Alert | Means | Triggered by | Debug |
+|---|---|---|---|
+| ⚠️ Update may be missed | A relevant post was found but publishing it to the channel failed | [`main.py`](main.py)'s handler, when `send_notification()` raises (bot lost admin/post rights, channel deleted, network blip, rate limit) | The alert links directly to the missed post. Then check `journalctl -u news-tracker -n 50 --no-pager` around that time; verify the news bot is still an admin with *Post Messages*. |
+| ⚠️ TRACKER DOWN | The whole process crashed or was killed | systemd's `ExecStopPost=` running [`alert_failure.py`](alert_failure.py) whenever `$SERVICE_RESULT != "success"` | The alert's log excerpt is often enough. Otherwise: `systemctl status news-tracker` for the exit code, `journalctl -u news-tracker -n 50 --no-pager` for the full traceback. |
+| ✅ Back to normal | Recovered after a TRACKER DOWN | [`main.py`](main.py) at startup, if `.last_failure` exists | Nothing to do. If DOWN arrived but this never did, `systemctl status news-tracker` — it likely crashed again before finishing startup. |
+| healthchecks.io "is down" / "is up" | The server may be unreachable, or the process is frozen (not crashed — systemd still sees it as running, so the alert above won't fire for this case) | Missed check-ins for ~15 min (5 min period + 10 min grace) | If you can't SSH in at all, check the Oracle Cloud console first. If you can, look for `[PING] failed to reach healthchecks.io` in the logs — that points to connectivity to that one host, not a full outage. |
+| ⚠️ CLASSIFIER DOWN / ✅ Classifier recovered | Gemini API is failing — the process itself is fine | [`filters.py`](filters.py), after 2 consecutive `llm_classify()` failures (not 1, since only 429s retry in-call) | `journalctl -u news-tracker \| grep "LLM error"`, or `sqlite3 decisions.db "select * from decisions where llm_reason like 'LLM error%' order by id desc limit 5;"`. Check quota/billing at aistudio.google.com. |
+| Channel resolution `FAIL` *(log only — no alert)* | A monitored channel couldn't be resolved at startup (renamed, deleted, or account removed from it) | [`main.py`](main.py)'s `resolve_channels()`, once per start | `journalctl -u news-tracker \| grep FAIL` right after a restart. Not wired to an alert — it only affects that one channel, silently, for the rest of that run, so check this manually after any restart or if a source channel seems to have gone quiet. |
+
 ## Project structure
 
 | File | Purpose |
