@@ -1,8 +1,10 @@
+import html
 import re
 import time
 import threading
 from google import genai
 from config import LLM_API_KEY
+from notifier import send_alert
 
 _MODEL = "gemini-3.1-flash-lite"
 _client = genai.Client(api_key=LLM_API_KEY)
@@ -13,6 +15,14 @@ _lock = threading.Lock()
 _last_call_time = 0.0
 _MIN_INTERVAL = 5.0
 _LABEL_RE = re.compile(r"^\s*line\s*\d+\s*:\s*", re.I)
+
+# A 429 already survives up to 2 in-call retries with backoff before giving
+# up; other errors (bad key, network drop, model unavailable) don't retry
+# at all. Requiring 2 separate failed calls before alerting avoids a false
+# alarm from one non-429 blip, while still catching a real outage fast.
+_LLM_ERROR_ALERT_THRESHOLD = 2
+_consecutive_llm_errors = 0
+_llm_error_alerted = False
 
 KEYWORDS = [
     # Age ranges
@@ -74,6 +84,32 @@ def keyword_match(text: str) -> bool:
     return any(kw.lower() in lower for kw in KEYWORDS)
 
 
+def _note_llm_success() -> None:
+    global _consecutive_llm_errors, _llm_error_alerted
+    _consecutive_llm_errors = 0
+    if _llm_error_alerted:
+        _llm_error_alerted = False
+        try:
+            send_alert("✅ <b>Classifier recovered</b> — posts are being evaluated normally again.")
+        except Exception as e:
+            print(f"[LLM] failed to send recovery alert: {e}")
+
+
+def _note_llm_failure(reason: str) -> None:
+    global _consecutive_llm_errors, _llm_error_alerted
+    _consecutive_llm_errors += 1
+    if _consecutive_llm_errors >= _LLM_ERROR_ALERT_THRESHOLD and not _llm_error_alerted:
+        _llm_error_alerted = True
+        try:
+            send_alert(
+                f"⚠️ <b>CLASSIFIER DOWN</b> — {html.escape(reason)}.\n"
+                f"Posts are being logged as NO without real review — "
+                f"you may be missing updates."
+            )
+        except Exception as e:
+            print(f"[LLM] failed to send failure alert: {e}")
+
+
 def llm_classify(text: str, channel: str) -> tuple[bool, str]:
     global _last_call_time
     prompt = _PROMPT_TEMPLATE.format(channel=channel, text=text[:2000])
@@ -97,6 +133,7 @@ def llm_classify(text: str, channel: str) -> tuple[bool, str]:
             verdict = _LABEL_RE.sub("", lines[0]).strip().upper()
             decision = verdict.startswith("YES")
             reason = _LABEL_RE.sub("", lines[1]).strip() if len(lines) > 1 else "(no reason)"
+            _note_llm_success()
             return decision, reason
         except Exception as e:
             if "429" in str(e) and attempt < 2:
@@ -104,6 +141,9 @@ def llm_classify(text: str, channel: str) -> tuple[bool, str]:
                 print(f"[WAIT] rate limited, retrying in {wait_time}s...")
                 time.sleep(wait_time)
                 continue
-            return False, f"LLM error: {e}"
+            error_reason = f"LLM error: {e}"
+            _note_llm_failure(error_reason)
+            return False, error_reason
 
+    _note_llm_failure("LLM error: max retries exceeded")
     return False, "LLM error: max retries exceeded"

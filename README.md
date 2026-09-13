@@ -47,6 +47,7 @@ but "it died quietly and nobody noticed." Two independent layers cover that:
 |---|---|---|
 | **[healthchecks.io](https://healthchecks.io) dead man's switch** | Server offline, network down, process hung, event loop stuck | The process checks in every 5 minutes. If check-ins stop, healthchecks.io (external infrastructure) messages you. |
 | **systemd `ExecStopPost=`** | Process crashed while the server is still up | [`alert_failure.py`](alert_failure.py) DMs you the cause immediately and writes a marker file. On its next successful start, `main.py` sees the marker and sends its own "back up" confirmation — a crash-and-restart is typically over in seconds, far faster than healthchecks.io's ~15 min detection window, so recovery can't wait on Layer 1 for this case. |
+| **LLM error tracking** | Gemini API down, key revoked/exhausted — process itself stays alive | Without this, a classifier outage looks identical to "no relevant news today": [`filters.py`](filters.py) would silently log every keyword match as `NO` forever. It alerts after 2 consecutive classification failures (not 1, since only 429s retry in-call — other errors return on the first hiccup, so 1 failure alone could be a fluke) and confirms recovery on the next success. |
 
 The first layer is the important one: a heartbeat *sent by* the app can never report the
 app's own death. Inverting it — the app checks in, and something external notices silence
