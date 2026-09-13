@@ -62,13 +62,8 @@ def main() -> None:
         f.write(why)
 
     send(
-        f"🔴 <b>News tracker stopped</b>\n\n"
-        f"The bot that watches for mobilization news is not running, so "
-        f"<b>you will not receive updates</b> until it is back.\n\n"
-        f"<b>What happened:</b> {why}\n\n"
-        f"It should restart itself automatically within a few seconds. "
-        f"You'll get a separate \"back up\" message the moment that's confirmed.\n\n"
-        f"<b>Details (for troubleshooting):</b>\n"
+        f"⚠️ <b>TRACKER DOWN</b> — {why}.\n"
+        f"Retrying automatically — I'll confirm once it's back.\n\n"
         f"<pre>{html.escape(logs[-1200:]) or 'no details available'}</pre>"
     )
 

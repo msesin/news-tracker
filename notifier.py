@@ -1,6 +1,7 @@
 import html
 import requests
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from config import (
     NEWS_BOT_TOKEN,
     NEWS_CHAT_ID,
@@ -10,6 +11,7 @@ from config import (
 
 _API = f"https://api.telegram.org/bot{NEWS_BOT_TOKEN}/sendMessage"
 _ALERT_API = f"https://api.telegram.org/bot{ALERT_BOT_TOKEN}/sendMessage"
+_KYIV = ZoneInfo("Europe/Kyiv")
 
 
 def send_notification(
@@ -21,13 +23,12 @@ def send_notification(
 ) -> None:
     excerpt = text[:300] + ("…" if len(text) > 300 else "")
     link = f"https://t.me/{username}/{message_id}"
-    time_str = timestamp.strftime("%Y-%m-%d %H:%M UTC")
+    time_str = timestamp.astimezone(_KYIV).strftime("%d %b, %H:%M")
 
     body = (
-        f"<b>{html.escape(channel_name)}</b>\n"
-        f"🕐 {time_str}\n\n"
+        f"<b>{html.escape(channel_name)}</b> · {time_str}\n\n"
         f"{html.escape(excerpt)}\n\n"
-        f"🔗 {link}"
+        f'<a href="{html.escape(link)}">Read full post →</a>'
     )
 
     resp = requests.post(

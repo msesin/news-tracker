@@ -19,13 +19,17 @@ client = TelegramClient(SESSION_FILE, TELEGRAM_API_ID, TELEGRAM_API_HASH)
 
 async def resolve_channels():
     # Keyed by the marked peer id (-100…) so lookups by event.chat_id match.
+    # The display name comes from Telegram's own entity.title, not a
+    # hand-typed translation in channels.py, so it always matches the
+    # channel's real name and never drifts out of sync.
     resolved = {}
     for ch in CHANNELS:
         try:
             entity = await client.get_entity(ch["username"])
             peer_id = utils.get_peer_id(entity)
-            resolved[peer_id] = {"name": ch["name"], "username": ch["username"]}
-            print(f"  OK  {ch['name']:25s}  id={peer_id}  @{ch['username']}")
+            name = getattr(entity, "title", None) or ch["name"]
+            resolved[peer_id] = {"name": name, "username": ch["username"]}
+            print(f"  OK  {name:25s}  id={peer_id}  @{ch['username']}")
         except Exception as e:
             print(f"  FAIL  {ch['name']:25s}  @{ch['username']}  — {e}")
     return resolved
@@ -61,13 +65,7 @@ async def main():
             cause = f.read().strip()
         os.remove(_FAILURE_MARKER)
         try:
-            send_alert(
-                f"🟢 <b>News tracker is back</b>\n\n"
-                f"It recovered from an earlier problem ({html.escape(cause)}) and is "
-                f"watching the news channels again. You will receive "
-                f"mobilization updates as normal.\n\n"
-                f"<b>Nothing for you to do.</b>"
-            )
+            send_alert(f"✅ <b>Back to normal</b> — recovered from: {html.escape(cause)}")
         except Exception as e:
             print(f"[RECOVERY] failed to send recovery alert: {e}")
 
@@ -124,13 +122,10 @@ async def main():
                 await loop.run_in_executor(
                     None,
                     send_alert,
-                    f"⚠️ <b>One update may have been missed</b>\n\n"
-                    f"The tracker found a relevant post but could not publish it "
-                    f"to the channel. Open the link below to read it yourself.\n\n"
-                    f"Source: {html.escape(channel_name)}\n"
-                    f"Post: https://t.me/{username}/{event.id}\n\n"
-                    f"Monitoring is still running — nothing else is broken.\n\n"
-                    f"Details: {html.escape(str(e))}",
+                    f"⚠️ <b>Update may be missed</b> — publish failed for "
+                    f"{html.escape(channel_name)}.\n\n"
+                    f'<a href="{html.escape(f"https://t.me/{username}/{event.id}")}">Read it directly →</a>\n\n'
+                    f"Monitoring continues normally.",
                 )
             except Exception as alert_error:
                 print(f"[ERR ] alert delivery also failed: {alert_error}")
