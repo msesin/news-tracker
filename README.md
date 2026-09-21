@@ -263,3 +263,7 @@ untouched.
 
 Tuning knobs live at the top of their modules: `KEYWORDS` and the prompt in `filters.py`,
 `PING_INTERVAL` in `main.py`, and the monitored channel list in `channels.py`.
+
+## License
+
+[MIT](LICENSE)
