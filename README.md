@@ -24,9 +24,12 @@ flowchart LR
    [Telethon](https://docs.telethon.dev/)) and listens for new posts in the channels
    listed in [`channels.py`](channels.py). A personal account is required here: bots
    cannot read channels they don't administer.
-2. **Keyword filter** — [`filters.py`](filters.py) does a cheap substring match
-   (`мобілізац`, `відстрочк`, `ТЦК`, `кордон`, …). This discards ~99% of posts without
-   spending an API call.
+2. **Keyword filter** — [`filters.py`](filters.py) does a cheap substring match on word
+   stems (`мобілізац`, `відстроч`, `ТЦК`, `кордон`, …), plus a regex for age brackets
+   that overlap 18–22 in any format (`18-22`, `від 18 до 60`, `22-річних`). Matching
+   brackets by regex rather than by literal string is what lets a post about men
+   "18–60" reach the classifier at all. This discards ~99% of posts without spending
+   an API call.
 3. **Classify** — surviving posts go to an LLM with a prompt that asks one question:
    does this describe a rule change affecting men 18–22? The keyword stage deliberately
    over-matches; this stage removes the false positives. This repo ships configured for

@@ -24,27 +24,53 @@ _LLM_ERROR_ALERT_THRESHOLD = 2
 _consecutive_llm_errors = 0
 _llm_error_alerted = False
 
+# Broad stems, matched as substrings: "мобілізац" already covers
+# "мобілізація/мобілізаційний/демобілізація", "призов" covers
+# "призовник/призовний вік", "кордон" covers "закордонний/прикордонний".
+# The stage is meant to over-match — the LLM removes the false positives —
+# so prefer a shorter stem over a longer phrase it already contains.
 KEYWORDS = [
-    # Age ranges
-    "18-22", "18–22", "18 до 22", "18 до 25", "18-23",
     # Mobilization
-    "мобілізац", "мобілізов", "демобілізац",
-    # Deferral / exemption
-    "відстрочк", "бронювання", "броню", "БЗВП",
-    # Border / travel
-    "виїзд за кордон", "перетин кордон", "кордон",
-    "№57", "постанова 57", "постанову 57", "постанова №57", "постанову №57",
-    # Military / draft
-    "військовозобов", "призов", "призивн",
+    "мобілізац", "мобілізов", "мобілізуват",
+    # Draft / conscription / service obligation
+    "призов", "призивн", "повістк", "строков служб", "військовозобов",
+    "військовий обов", "військового обов", "військовому обов",
+    "військова служб", "військової служб", "військову служб",
+    "військовий облік", "військового обліку",
+    "військова підготовк", "військової підготовк", "бзвп",
+    # Deferral / exemption / booking
+    "відстроч", "броню", "заброньован", "непридатн", "обмежено придатн",
+    # Age thresholds named in words rather than digits
+    "віковий ценз", "знизити вік", "зниження віку", "підвищити вік",
+    "підвищення віку", "юнак", "молоді чоловік", "молодих чоловік",
+    # Border / exit rules
+    "кордон", "виїзд", "виїхат", "виїжджат", "невиїзд", "трудовий фронт",
+    "трудового фронт", "трудовому фронт",
     # Institutions
-    "ТЦК", "військкомат",
-    # Law changes — specific military phrases only (avoid matching "незаконний" etc.)
-    "закон про мобілізац", "закон про призов", "закон про відстрочк",
-    "законопроект про мобілізац", "законопроект про призов", "законопроект про відстрочк",
-    "указ президента",
+    "тцк", "військкомат", "комісаріат", "міноборони",
+    "міністерство оборони", "міністерства оборони", "генштаб",
+    # Legal instruments — military-specific only; bare "закон"/"постанова"
+    # would match most political news and flood the classifier.
+    "№57", "постанова 57", "постанову 57", "указ президента",
     # English terms (for forwarded content)
-    "mobilization", "conscription", "draft exemption", "border crossing",
+    "mobilization", "mobilisation", "conscription", "draft exemption",
+    "draft age", "military age", "military service", "border crossing",
+    "travel ban", "exit ban",
 ]
+
+# Age brackets go through a regex instead of literal strings. A headline about
+# restricting exit for men "18–60" is about this group too, but no literal
+# spelled out here would ever have caught it — and the prompt already tells the
+# model to accept overlapping brackets, so the gate has to let them through.
+# Any bracket overlapping 18–22 counts, in whatever format the post writes it
+# ("18-22", "18 – 60", "від 18 до 60", "20 та 27"), as does a single age
+# inside the range ("22-річних", "19 років").
+_TARGET_MIN, _TARGET_MAX = 18, 22
+_PLAUSIBLE_AGES = range(14, 71)  # outside this the digits aren't an age
+# A digit flanked by : . , % is a time, decimal or percentage, not an age.
+_RANGE_SEP = r"(?:\s*[-–—‒―]\s*|\s*/\s*|\s+(?:до|по|та|і|й|to|and)\s+)"
+_AGE_RANGE_RE = re.compile(rf"(?<![\d:.,])(\d{{1,2}}){_RANGE_SEP}(\d{{1,2}})(?![\d:.,%])")
+_SINGLE_AGE_RE = re.compile(r"(?<![\d:.,])(\d{1,2})\s*[-–—]?\s*(?:річ|рок|рік|літн|year)")
 
 _PROMPT_TEMPLATE = """\
 You are monitoring Ukrainian Telegram news channels for posts relevant to changes \
@@ -79,9 +105,22 @@ in English explaining why.
 """
 
 
+def _age_bracket_match(lower: str) -> bool:
+    """True if the text names an age range overlapping 18–22, or a single age in it."""
+    for a, b in _AGE_RANGE_RE.findall(lower):
+        lo, hi = sorted((int(a), int(b)))
+        if (lo in _PLAUSIBLE_AGES and hi in _PLAUSIBLE_AGES
+                and lo <= _TARGET_MAX and hi >= _TARGET_MIN):
+            return True
+    return any(_TARGET_MIN <= int(a) <= _TARGET_MAX
+               for a in _SINGLE_AGE_RE.findall(lower))
+
+
 def keyword_match(text: str) -> bool:
     lower = text.lower()
-    return any(kw.lower() in lower for kw in KEYWORDS)
+    if any(kw.lower() in lower for kw in KEYWORDS):
+        return True
+    return _age_bracket_match(lower)
 
 
 def _note_llm_success() -> None:
