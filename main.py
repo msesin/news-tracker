@@ -1,5 +1,6 @@
 import asyncio
 import html
+import json
 import os
 import requests
 from telethon import TelegramClient, events, utils
@@ -7,9 +8,13 @@ from config import TELEGRAM_API_ID, TELEGRAM_API_HASH, HEALTHCHECK_URL
 from channels import CHANNELS
 from filters import keyword_match, llm_classify
 from storage import init_db, log_decision, is_duplicate, mark_seen
-from notifier import send_notification, send_alert
+from notifier import send_notification, send_alert, send_text
 
-_FAILURE_MARKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".last_failure")
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_FAILURE_MARKER = os.path.join(_HERE, ".last_failure")
+_DOWNTIME = os.path.join(_HERE, ".downtime")
+
+CHANNEL_UP_MESSAGE = "✅ Бот знову працює — моніторинг відновлено."
 
 SESSION_FILE = "news_tracker"
 PING_INTERVAL = 300
@@ -33,6 +38,36 @@ async def resolve_channels():
         except Exception as e:
             print(f"  FAIL  {ch['name']:25s}  @{ch['username']}  — {e}")
     return resolved
+
+
+async def announce_recovery_when_stable(loop: asyncio.AbstractEventLoop) -> None:
+    """Clears the outage clock, and tells the channel it's back if the channel
+    was told it was down.
+
+    Waits one full healthcheck period first: a tracker that starts, posts "we're
+    back", then dies again is a crash loop, and announcing each lap of it would
+    spam subscribers with down/up pairs. Staying up this long is the cheapest
+    available proof that the restart actually took. Leaving the file in place
+    until then is also what lets alert_failure.py accumulate towards its
+    15-minute threshold across restarts instead of restarting the clock.
+    """
+    await asyncio.sleep(PING_INTERVAL)
+    try:
+        with open(_DOWNTIME) as f:
+            state = json.load(f)
+    except (OSError, ValueError):
+        return
+
+    # Removed before the post, not after: at worst the channel misses one
+    # "we're back", which beats announcing it twice.
+    os.remove(_DOWNTIME)
+    if not state.get("channel_notified"):
+        return
+    try:
+        await loop.run_in_executor(None, send_text, CHANNEL_UP_MESSAGE)
+        print("[RECOVERY] posted channel recovery notice")
+    except Exception as e:
+        print(f"[RECOVERY] failed to post channel recovery notice: {e}")
 
 
 async def healthcheck_ping(loop: asyncio.AbstractEventLoop) -> None:
@@ -75,6 +110,7 @@ async def main():
 
     loop = asyncio.get_event_loop()
     asyncio.create_task(healthcheck_ping(loop))
+    asyncio.create_task(announce_recovery_when_stable(loop))
 
     @client.on(events.NewMessage(chats=list(channel_map.keys())))
     async def handler(event):

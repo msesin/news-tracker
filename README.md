@@ -50,13 +50,27 @@ database, so the filter's behaviour can be audited after the fact.
 ## Staying alive
 
 The tracker is a long-running process, so the interesting failure is not "it crashed"
-but "it died quietly and nobody noticed." Two independent layers cover that:
+but "it died quietly and nobody noticed." Four independent layers cover that — the first
+three tell you, the last one tells your subscribers:
 
 | Layer | Catches | How you find out |
 |---|---|---|
 | **Dead man's switch** ([healthchecks.io](https://healthchecks.io) in this repo) | Server offline, network down, process hung, event loop stuck | The process checks in every 5 minutes. If check-ins stop, the external service messages you. |
 | **systemd `ExecStopPost=`** | Process crashed while the server is still up | [`alert_failure.py`](alert_failure.py) DMs you the cause immediately and writes a marker file. On its next successful start, `main.py` sees the marker and sends its own "back up" confirmation — a crash-and-restart is typically over in seconds, far faster than healthchecks.io's ~15 min detection window, so recovery can't wait on Layer 1 for this case. |
+| **Channel escalation** | An outage that outlives 15 minutes of self-recovery | Everything above is for *you*. This one is for *subscribers*: after 15 minutes of continuous failure [`alert_failure.py`](alert_failure.py) posts one line to the channel itself, and [`main.py`](main.py) posts one when it's back. Below that threshold the channel stays silent, because a crash that systemd fixes in 5 seconds is not news. |
 | **LLM error tracking** | The LLM API is down or the key is revoked/exhausted — process itself stays alive | Without this, a classifier outage looks identical to "no relevant news today": [`filters.py`](filters.py) would silently log every keyword match as `NO` forever. It alerts after 2 consecutive classification failures (not 1, since only 429s retry in-call — other errors return on the first hiccup, so 1 failure alone could be a fluke) and confirms recovery on the next success. |
+
+Why tell the channel at all: to a subscriber, "the bot is down" and "nothing has changed
+in the rules" look identical — both are an empty channel. That ambiguity is the whole
+problem this project exists to solve, so an outage long enough to be mistaken for calm
+has to say so out loud. 15 minutes is the threshold because it is the point at which the
+dead man's switch also gives up on the process, and because ~150 failed systemd restarts
+is well past any transient blip.
+
+The recovery notice deliberately waits one full `PING_INTERVAL` of uptime before it
+posts. A tracker that announces "we're back" the instant it starts will announce it once
+per lap of a crash loop; making it prove it can stay up first means subscribers see one
+down/up pair per outage, not twenty.
 
 The first layer is the important one: a heartbeat *sent by* the app can never report the
 app's own death. Inverting it — the app checks in, and something external notices silence
@@ -137,6 +151,8 @@ asyncio.create_task(daily_heartbeat(loop))
 | ⚠️ Update may be missed | A relevant post was found but publishing it to the channel failed | [`main.py`](main.py)'s handler, when `send_notification()` raises (bot lost admin/post rights, channel deleted, network blip, rate limit) | The alert links directly to the missed post. Then check `journalctl -u news-tracker -n 50 --no-pager` around that time; verify the news bot is still an admin with *Post Messages*. |
 | ⚠️ TRACKER DOWN | The whole process crashed or was killed | systemd's `ExecStopPost=` running [`alert_failure.py`](alert_failure.py) whenever `$SERVICE_RESULT != "success"` | The alert's log excerpt is often enough. Otherwise: `systemctl status news-tracker` for the exit code, `journalctl -u news-tracker -n 50 --no-pager` for the full traceback. |
 | ✅ Back to normal | Recovered after a TRACKER DOWN | [`main.py`](main.py) at startup, if `.last_failure` exists | Nothing to do. If DOWN arrived but this never did, `systemctl status news-tracker` — it likely crashed again before finishing startup. |
+| ⚠️ Бот тимчасово не працює *(posted to the channel, not DMed)* | The tracker has been failing continuously for 15+ minutes, so subscribers are told the silence is a fault, not calm | [`alert_failure.py`](alert_failure.py)'s `escalate_if_still_down()`, once per outage — the clock lives in `.downtime` and survives restarts | You will already have had a TRACKER DOWN DM 15 minutes earlier; debug from that. `cat .downtime` shows when the outage started and whether the channel was told. |
+| ✅ Бот знову працює *(posted to the channel)* | The tracker recovered from an outage the channel was told about | [`main.py`](main.py)'s `announce_recovery_when_stable()`, one `PING_INTERVAL` after a successful start | Nothing to do. If the down notice appeared but this didn't, the process is restarting but not staying up — `journalctl -u news-tracker -n 50 --no-pager`. |
 | healthchecks.io "is down" / "is up" | The server may be unreachable, or the process is frozen (not crashed — systemd still sees it as running, so the alert above won't fire for this case) | Missed check-ins for ~15 min (5 min period + 10 min grace) | If you can't SSH in at all, check the Oracle Cloud console first. If you can, look for `[PING] failed to reach healthchecks.io` in the logs — that points to connectivity to that one host, not a full outage. |
 | ⚠️ CLASSIFIER DOWN / ✅ Classifier recovered | The LLM API is failing — the process itself is fine | [`filters.py`](filters.py), after 2 consecutive `llm_classify()` failures (not 1, since only 429s retry in-call) | `journalctl -u news-tracker \| grep "LLM error"`, or `sqlite3 decisions.db "select * from decisions where llm_reason like 'LLM error%' order by id desc limit 5;"`. For Gemini specifically, check quota/billing at aistudio.google.com — for another provider, check theirs. |
 | Channel resolution `FAIL` *(log only — no alert)* | A monitored channel couldn't be resolved at startup (renamed, deleted, or account removed from it) | [`main.py`](main.py)'s `resolve_channels()`, once per start | `journalctl -u news-tracker \| grep FAIL` right after a restart. Not wired to an alert — it only affects that one channel, silently, for the rest of that run, so check this manually after any restart or if a source channel seems to have gone quiet. |
@@ -145,7 +161,7 @@ asyncio.create_task(daily_heartbeat(loop))
 
 | File | Purpose |
 |---|---|
-| [`main.py`](main.py) | Event loop, message handler, healthcheck ping |
+| [`main.py`](main.py) | Event loop, message handler, healthcheck ping, recovery notices |
 | [`channels.py`](channels.py) | The list of monitored source channels |
 | [`filters.py`](filters.py) | Keyword list, LLM prompt, rate limiter |
 | [`storage.py`](storage.py) | SQLite decision log and 24h deduplication |

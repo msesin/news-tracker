@@ -8,3 +8,4 @@ decisions.db
 .vscode/
 news-tracker.code-workspace
 .last_failure
+.downtime
