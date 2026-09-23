@@ -28,7 +28,7 @@ def send_notification(
     body = (
         f"<b>{html.escape(channel_name)}</b> · {time_str}\n\n"
         f"{html.escape(excerpt)}\n\n"
-        f'<a href="{html.escape(link)}">Read full post →</a>'
+        f'<a href="{html.escape(link)}">Читати повний пост →</a>'
     )
 
     resp = requests.post(
