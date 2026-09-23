@@ -2,9 +2,10 @@ import html
 import re
 import time
 import threading
+from datetime import datetime, timezone
 from google import genai
 from config import LLM_API_KEY
-from notifier import send_alert
+from notifier import send_alert, send_text
 
 _MODEL = "gemini-3.1-flash-lite"
 _client = genai.Client(api_key=LLM_API_KEY)
@@ -23,6 +24,27 @@ _LABEL_RE = re.compile(r"^\s*line\s*\d+\s*:\s*", re.I)
 _LLM_ERROR_ALERT_THRESHOLD = 2
 _consecutive_llm_errors = 0
 _llm_error_alerted = False
+
+# The process itself can be perfectly healthy — connected to Telegram, pinging
+# healthchecks.io on schedule — while the classifier is the thing that's broken
+# (quota exhausted, provider outage). healthchecks can't see that: it only
+# watches for a heartbeat, and this failure doesn't stop the heartbeat. So this
+# is the one channel-facing outage notice that has to come from inside the
+# process rather than from an external ping. It uses the same 15-minute bar as
+# the dead man's switch, but measured differently by necessity: this is only
+# ever checked when a post actually reaches the classifier, so on a quiet day
+# with no matching posts, an outage can go undetected past 15 minutes — there's
+# no free way to poll the LLM just to test it without spending quota on it.
+_LLM_CHANNEL_ALERT_AFTER = 15 * 60
+_llm_outage_since: datetime | None = None
+_llm_channel_alerted = False
+
+# Kept in sync with the wording used in healthchecks.io's webhook integration
+# (see README) — same message either way, whether the tracker is fully down
+# or just its classifier, since either way a subscriber's advice is the same:
+# "don't trust the channel's silence right now."
+CHANNEL_DOWN_MESSAGE = "⚠️ Бот тимчасово не працює"
+CHANNEL_UP_MESSAGE = "✅ Бот знову працює"
 
 # Broad stems, matched as substrings: "мобілізац" already covers
 # "мобілізація/мобілізаційний/демобілізація", "призов" covers
@@ -124,19 +146,33 @@ def keyword_match(text: str) -> bool:
 
 
 def _note_llm_success() -> None:
-    global _consecutive_llm_errors, _llm_error_alerted
+    global _consecutive_llm_errors, _llm_error_alerted, _llm_outage_since, _llm_channel_alerted
     _consecutive_llm_errors = 0
+    # Any success means the API is not down — a real outage never has one of
+    # these in the middle of it. Reset the wall-clock immediately, so a flaky
+    # run of alternating success/failure never accumulates into a false alarm.
+    _llm_outage_since = None
     if _llm_error_alerted:
         _llm_error_alerted = False
         try:
             send_alert("✅ <b>Classifier recovered</b> — posts are being evaluated normally again.")
         except Exception as e:
             print(f"[LLM] failed to send recovery alert: {e}")
+    if _llm_channel_alerted:
+        _llm_channel_alerted = False
+        try:
+            send_text(CHANNEL_UP_MESSAGE)
+        except Exception as e:
+            print(f"[LLM] failed to send channel recovery notice: {e}")
 
 
 def _note_llm_failure(reason: str) -> None:
-    global _consecutive_llm_errors, _llm_error_alerted
+    global _consecutive_llm_errors, _llm_error_alerted, _llm_outage_since, _llm_channel_alerted
     _consecutive_llm_errors += 1
+    now = datetime.now(timezone.utc)
+    if _llm_outage_since is None:
+        _llm_outage_since = now
+
     if _consecutive_llm_errors >= _LLM_ERROR_ALERT_THRESHOLD and not _llm_error_alerted:
         _llm_error_alerted = True
         try:
@@ -147,6 +183,14 @@ def _note_llm_failure(reason: str) -> None:
             )
         except Exception as e:
             print(f"[LLM] failed to send failure alert: {e}")
+
+    if (not _llm_channel_alerted
+            and (now - _llm_outage_since).total_seconds() >= _LLM_CHANNEL_ALERT_AFTER):
+        _llm_channel_alerted = True
+        try:
+            send_text(CHANNEL_DOWN_MESSAGE)
+        except Exception as e:
+            print(f"[LLM] failed to send channel outage notice: {e}")
 
 
 def llm_classify(text: str, channel: str) -> tuple[bool, str]:

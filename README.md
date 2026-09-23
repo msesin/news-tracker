@@ -50,36 +50,57 @@ database, so the filter's behaviour can be audited after the fact.
 ## Staying alive
 
 The tracker is a long-running process, so the interesting failure is not "it crashed"
-but "it died quietly and nobody noticed." Four independent layers cover that — the first
-three tell you, the last one tells your subscribers:
+but "it died quietly and nobody noticed." Three independent layers cover that, and they
+deliberately watch different things — each one catches a failure the others structurally
+can't see:
 
 | Layer | Catches | How you find out |
 |---|---|---|
-| **Dead man's switch** ([healthchecks.io](https://healthchecks.io) in this repo) | Server offline, network down, process hung, event loop stuck | The process checks in every 5 minutes. If check-ins stop, the external service messages you. |
-| **systemd `ExecStopPost=`** | Process crashed while the server is still up | [`alert_failure.py`](alert_failure.py) DMs you the cause immediately and writes a marker file. On its next successful start, `main.py` sees the marker and sends its own "back up" confirmation — a crash-and-restart is typically over in seconds, far faster than healthchecks.io's ~15 min detection window, so recovery can't wait on Layer 1 for this case. |
-| **Channel escalation** | An outage that outlives 15 minutes of self-recovery | Everything above is for *you*. This one is for *subscribers*: after 15 minutes of continuous failure [`alert_failure.py`](alert_failure.py) posts one line to the channel itself, and [`main.py`](main.py) posts one when it's back. Below that threshold the channel stays silent, because a crash that systemd fixes in 5 seconds is not news. |
-| **LLM error tracking** | The LLM API is down or the key is revoked/exhausted — process itself stays alive | Without this, a classifier outage looks identical to "no relevant news today": [`filters.py`](filters.py) would silently log every keyword match as `NO` forever. It alerts after 2 consecutive classification failures (not 1, since only 429s retry in-call — other errors return on the first hiccup, so 1 failure alone could be a fluke) and confirms recovery on the next success. |
+| **Dead man's switch** ([healthchecks.io](https://healthchecks.io) in this repo) | Server offline, network down, process hung, event loop stuck — anything that stops the heartbeat, including cases where nothing on the box can run code at all | The process checks in every 5 minutes. If check-ins stop for 15 minutes, healthchecks.io DMs you **and** posts to the channel (its own webhook integration — see below). It also posts to the channel the moment check-ins resume. |
+| **systemd `ExecStopPost=`** | Process crashed while the server is still up | [`alert_failure.py`](alert_failure.py) DMs you the cause immediately (cooled down to at most once per 10 minutes, so a crash loop can't turn into ~150 DMs) and writes a marker file. On its next successful start, `main.py` sees the marker and sends its own "back up" DM — a crash-and-restart is typically over in seconds, far faster than healthchecks.io's ~15 min detection window, so recovery can't wait on the switch for this case. This layer is private-only on purpose: telling the channel about an outage is the switch's job, since it also catches this same failure (the process stopping) whenever the process manages to check in at least once per restart, which a crash loop usually does. |
+| **LLM outage escalation** | The LLM API is down or exhausted — the process itself, and its Telegram connection, are both fine | The switch can't see this: pings keep flowing on schedule regardless of whether the classifier is working, since checking in doesn't touch the LLM at all. So this is the one channel notice that has to come from inside the process. [`filters.py`](filters.py) DMs after 2 consecutive classification failures (fast — not gated on 15 minutes) and, if the outage is still going 15 minutes after the *first* of those failures, posts to the channel too. Confirms recovery (DM and channel) on the next successful classification. |
 
 Why tell the channel at all: to a subscriber, "the bot is down" and "nothing has changed
 in the rules" look identical — both are an empty channel. That ambiguity is the whole
 problem this project exists to solve, so an outage long enough to be mistaken for calm
-has to say so out loud. 15 minutes is the threshold because it is the point at which the
-dead man's switch also gives up on the process, and because ~150 failed systemd restarts
-is well past any transient blip.
+has to say so out loud. 15 minutes is the threshold in both cases that reach the channel,
+so subscribers learn about a real outage on roughly the same timescale no matter which
+of the two it is.
 
-The recovery notice deliberately waits one full `PING_INTERVAL` of uptime before it
-posts. A tracker that announces "we're back" the instant it starts will announce it once
-per lap of a crash loop; making it prove it can stay up first means subscribers see one
-down/up pair per outage, not twenty.
+These two channel-facing layers were kept deliberately separate rather than merged into
+one, because they watch genuinely different things and merging them would either miss
+failures or double up on the same one. The switch only knows "no heartbeat"; it cannot
+tell a dead classifier from a fine one, because the heartbeat doesn't touch the
+classifier. [`filters.py`](filters.py) only knows about classification calls; it has no
+way to know if the server itself is gone. Handing *both* jobs to the switch would drop
+the LLM case; handing *both* to the process would drop the "process can't even run
+`alert_failure.py`" case (e.g. the whole server is down). Each layer's 15-minute clock
+is also measured differently for the same reason: the switch's clock is wall-clock time
+since the last ping, restarted by nothing; the classifier's clock is wall-clock time
+since the *first* consecutive failure, and is only ever checked when an actual post
+reaches the classifier — on a quiet day with no matching posts, a classifier outage can
+run past 15 minutes before anything notices, since there's no free way to probe the LLM
+just to test it without spending quota on it.
 
 The first layer is the important one: a heartbeat *sent by* the app can never report the
 app's own death. Inverting it — the app checks in, and something external notices silence
 — is what makes "the server is gone" detectable. This repo uses healthchecks.io (generous
-free tier, easy Telegram webhook), but the mechanism is generic — any service that accepts
-a periodic HTTP ping and alerts on silence works the same way (Cronitor, Better Uptime,
-UptimeRobot's heartbeat monitors, a self-hosted alternative, …). Unlike the LLM, swapping
-this needs **no code change at all** — just point `HEALTHCHECK_URL` at the new ping URL
-and update the webhook integration on that service's side.
+free tier, easy Telegram + webhook integrations), but the mechanism is generic — any
+service that accepts a periodic HTTP ping and alerts on silence works the same way
+(Cronitor, Better Uptime, UptimeRobot's heartbeat monitors, a self-hosted alternative, …).
+Unlike the LLM, swapping this needs **no code change at all** — just point
+`HEALTHCHECK_URL` at the new ping URL and update the integrations on that service's side.
+
+**Setting up the channel webhook:** in healthchecks.io, add a second integration to the
+same check — Integrations → Add Integration → Webhook — independent of whatever
+integration already DMs you. Configure its request bodies as JSON POSTs to
+`https://api.telegram.org/bot<NEWS_BOT_TOKEN>/sendMessage`, with
+`{"chat_id": "<NEWS_CHAT_ID>", "text": "⚠️ Бот тимчасово не працює"}` on failure and
+`{"chat_id": "<NEWS_CHAT_ID>", "text": "✅ Бот знову працює"}` on recovery, then enable
+the new integration on the check itself (the existing one stays on, untouched). The
+message text is a plain constant in this repo ([`filters.py`](filters.py)'s
+`CHANNEL_DOWN_MESSAGE`/`CHANNEL_UP_MESSAGE`) — if you change the wording there, update the
+webhook's request bodies to match, since the two aren't wired together.
 
 The check-in is gated on `client.is_connected()`, so a process that is technically alive
 but silently disconnected from Telegram still trips the alarm instead of looking healthy.
@@ -149,19 +170,18 @@ asyncio.create_task(daily_heartbeat(loop))
 | Alert | Means | Triggered by | Debug |
 |---|---|---|---|
 | ⚠️ Update may be missed | A relevant post was found but publishing it to the channel failed | [`main.py`](main.py)'s handler, when `send_notification()` raises (bot lost admin/post rights, channel deleted, network blip, rate limit) | The alert links directly to the missed post. Then check `journalctl -u news-tracker -n 50 --no-pager` around that time; verify the news bot is still an admin with *Post Messages*. |
-| ⚠️ TRACKER DOWN | The whole process crashed or was killed | systemd's `ExecStopPost=` running [`alert_failure.py`](alert_failure.py) whenever `$SERVICE_RESULT != "success"` | The alert's log excerpt is often enough. Otherwise: `systemctl status news-tracker` for the exit code, `journalctl -u news-tracker -n 50 --no-pager` for the full traceback. |
-| ✅ Back to normal | Recovered after a TRACKER DOWN | [`main.py`](main.py) at startup, if `.last_failure` exists | Nothing to do. If DOWN arrived but this never did, `systemctl status news-tracker` — it likely crashed again before finishing startup. |
-| ⚠️ Бот тимчасово не працює *(posted to the channel, not DMed)* | The tracker has been failing continuously for 15+ minutes, so subscribers are told the silence is a fault, not calm | [`alert_failure.py`](alert_failure.py)'s `escalate_if_still_down()`, once per outage — the clock lives in `.downtime` and survives restarts | You will already have had a TRACKER DOWN DM 15 minutes earlier; debug from that. `cat .downtime` shows when the outage started and whether the channel was told. |
-| ✅ Бот знову працює *(posted to the channel)* | The tracker recovered from an outage the channel was told about | [`main.py`](main.py)'s `announce_recovery_when_stable()`, one `PING_INTERVAL` after a successful start | Nothing to do. If the down notice appeared but this didn't, the process is restarting but not staying up — `journalctl -u news-tracker -n 50 --no-pager`. |
-| healthchecks.io "is down" / "is up" | The server may be unreachable, or the process is frozen (not crashed — systemd still sees it as running, so the alert above won't fire for this case) | Missed check-ins for ~15 min (5 min period + 10 min grace) | If you can't SSH in at all, check the Oracle Cloud console first. If you can, look for `[PING] failed to reach healthchecks.io` in the logs — that points to connectivity to that one host, not a full outage. |
-| ⚠️ CLASSIFIER DOWN / ✅ Classifier recovered | The LLM API is failing — the process itself is fine | [`filters.py`](filters.py), after 2 consecutive `llm_classify()` failures (not 1, since only 429s retry in-call) | `journalctl -u news-tracker \| grep "LLM error"`, or `sqlite3 decisions.db "select * from decisions where llm_reason like 'LLM error%' order by id desc limit 5;"`. For Gemini specifically, check quota/billing at aistudio.google.com — for another provider, check theirs. |
+| ⚠️ TRACKER DOWN *(DM only)* | The whole process crashed or was killed | systemd's `ExecStopPost=` running [`alert_failure.py`](alert_failure.py) whenever `$SERVICE_RESULT != "success"`, cooled down to at most once per 10 minutes per outage | The alert's log excerpt is often enough. Otherwise: `systemctl status news-tracker` for the exit code, `journalctl -u news-tracker -n 50 --no-pager` for the full traceback. |
+| ✅ Back to normal *(DM only)* | Recovered after a TRACKER DOWN | [`main.py`](main.py) at startup, if `.last_failure` exists | Nothing to do. If DOWN arrived but this never did, `systemctl status news-tracker` — it likely crashed again before finishing startup. |
+| healthchecks.io "is down" / "is up" *(DM + posted to the channel)* | The server may be unreachable, or the process is frozen (not crashed — systemd still sees it as running, so TRACKER DOWN won't fire for this case) — or anything else that stops check-ins, including the whole server being gone | Missed check-ins for ~15 min (5 min period + 10 min grace); the channel side is the webhook integration set up above | If you can't SSH in at all, check the Oracle Cloud console first. If you can, look for `[PING] failed to reach healthchecks.io` in the logs — that points to connectivity to that one host, not a full outage. |
+| ⚠️ CLASSIFIER DOWN / ✅ Classifier recovered *(DM, fast)* | The LLM API is failing — the process itself is fine | [`filters.py`](filters.py), after 2 consecutive `llm_classify()` failures (not 1, since only 429s retry in-call) | `journalctl -u news-tracker \| grep "LLM error"`, or `sqlite3 decisions.db "select * from decisions where llm_reason like 'LLM error%' order by id desc limit 5;"`. For Gemini specifically, check quota/billing at aistudio.google.com — for another provider, check theirs. |
+| ⚠️/✅ Бот тимчасово не працює / Бот знову працює *(posted to the channel — LLM outage only)* | The same LLM outage as above has now lasted 15+ minutes measured from the first failure, so subscribers are told the channel's silence may not mean "no news" | [`filters.py`](filters.py)'s `_note_llm_failure()` / `_note_llm_success()` | You will already have a CLASSIFIER DOWN DM from when this started; debug from that — check Gemini's quota/billing dashboard. |
 | Channel resolution `FAIL` *(log only — no alert)* | A monitored channel couldn't be resolved at startup (renamed, deleted, or account removed from it) | [`main.py`](main.py)'s `resolve_channels()`, once per start | `journalctl -u news-tracker \| grep FAIL` right after a restart. Not wired to an alert — it only affects that one channel, silently, for the rest of that run, so check this manually after any restart or if a source channel seems to have gone quiet. |
 
 ## Project structure
 
 | File | Purpose |
 |---|---|
-| [`main.py`](main.py) | Event loop, message handler, healthcheck ping, recovery notices |
+| [`main.py`](main.py) | Event loop, message handler, healthcheck ping |
 | [`channels.py`](channels.py) | The list of monitored source channels |
 | [`filters.py`](filters.py) | Keyword list, LLM prompt, rate limiter |
 | [`storage.py`](storage.py) | SQLite decision log and 24h deduplication |

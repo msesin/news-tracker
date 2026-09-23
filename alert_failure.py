@@ -2,11 +2,12 @@
 """Run by systemd (ExecStopPost=) every time the tracker stops. Sends a
 plain-language DM only when the stop was NOT a clean, intentional stop.
 
-A single crash is the tracker's own business: systemd restarts it in seconds
-and subscribers never need to know. An outage that survives 15 minutes of
-self-recovery is different — by then the channel's silence is indistinguishable
-from "no news", which is exactly the wrong impression to leave — so the channel
-gets a one-line notice too.
+Telling the *channel* about this class of outage (process crashed / server
+unreachable) is deliberately not this script's job — healthchecks.io's own
+webhook integration covers it, since it detects the same thing (no
+heartbeat) even in cases where this script can't run at all (e.g. the whole
+server is down). Doing it twice would mean two independent 15-minute clocks
+racing to post the same notice.
 """
 import html
 import json
@@ -23,24 +24,18 @@ from dotenv import load_dotenv
 _HERE = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(_HERE, ".env"))
 _MARKER = os.path.join(_HERE, ".last_failure")
-_DOWNTIME = os.path.join(_HERE, ".downtime")
+_STATE = os.path.join(_HERE, ".downtime")
 
 TOKEN = os.environ.get("ALERT_BOT_TOKEN", "")
 CHAT_ID = os.environ.get("ALERT_CHAT_ID", "")
-NEWS_TOKEN = os.environ.get("NEWS_BOT_TOKEN", "")
-NEWS_CHAT_ID = os.environ.get("NEWS_CHAT_ID", "")
 
-# How long the tracker may keep failing on its own before subscribers are told.
-# systemd retries every 5 s (RestartSec=), so 15 minutes of continuous failure
-# is well past "transient blip". It also matches the dead man's switch's own
-# ~15 min detection window, so both layers escalate at the same moment rather
-# than at two confusingly different times.
-_ESCALATE_AFTER = 15 * 60
-
-CHANNEL_DOWN_MESSAGE = (
-    "⚠️ Бот тимчасово не працює — стежте за новинами самостійно. "
-    "Повідомимо, щойно він відновиться."
-)
+# systemd retries every 5 s, so a tracker that cannot start at all fails ~150
+# times before 15 minutes are up. Without a cooldown that is ~150 DMs for a
+# single outage, which buries the one message that mattered — the first. Old
+# timestamps left over from a past, already-resolved outage don't need to be
+# cleared for this to work: `_due()` compares against "now", so a last_dm from
+# days ago is just as stale as no last_dm at all.
+_DM_COOLDOWN = 10 * 60
 
 # systemd's terse result codes, in words a human can act on.
 REASONS = {
@@ -63,18 +58,6 @@ def send(text: str) -> None:
     resp.raise_for_status()
 
 
-def send_to_channel(text: str) -> None:
-    """Posts with the news bot, not the alert bot — the alert bot has no
-    business in the public channel and isn't an admin there."""
-    resp = requests.post(
-        f"https://api.telegram.org/bot{NEWS_TOKEN}/sendMessage",
-        json={"chat_id": NEWS_CHAT_ID, "text": text,
-              "disable_web_page_preview": True},
-        timeout=10,
-    )
-    resp.raise_for_status()
-
-
 def sh(*cmd: str) -> str:
     """Never raises: collecting log context is a nice-to-have, and must not be
     the reason an outage alert goes unsent."""
@@ -84,39 +67,21 @@ def sh(*cmd: str) -> str:
         return f"(could not read logs: {e})"
 
 
-def _load_downtime() -> dict:
+def _load_state() -> dict:
     try:
-        with open(_DOWNTIME) as f:
+        with open(_STATE) as f:
             return json.load(f)
     except (OSError, ValueError):
         return {}
 
 
-def escalate_if_still_down() -> None:
-    """Post to the channel once, and only once, per outage.
-
-    The clock starts at the first failed stop and is cleared by main.py only
-    after the tracker has proven it can stay up — so a crash loop accumulates
-    towards the 15 minutes instead of resetting the timer on every restart.
-    """
-    state = _load_downtime()
-    now = datetime.now(timezone.utc)
+def _due(last: str | None, now: datetime, cooldown: int) -> bool:
+    """True if `cooldown` has passed since `last` — or if there is no `last` yet,
+    so the first DM of an outage always goes out immediately."""
     try:
-        since = datetime.fromisoformat(state["since"])
-    except (KeyError, ValueError):
-        since = now
-        state = {"since": now.isoformat(), "channel_notified": False}
-
-    if (not state.get("channel_notified")
-            and (now - since).total_seconds() >= _ESCALATE_AFTER):
-        try:
-            send_to_channel(CHANNEL_DOWN_MESSAGE)
-            state["channel_notified"] = True
-        except Exception as e:
-            print(f"[ALERT] channel notice failed: {e}", file=sys.stderr)
-
-    with open(_DOWNTIME, "w") as f:
-        json.dump(state, f)
+        return (now - datetime.fromisoformat(last)).total_seconds() >= cooldown
+    except (TypeError, ValueError):
+        return True
 
 
 def main() -> None:
@@ -137,18 +102,20 @@ def main() -> None:
     with open(_MARKER, "w") as f:
         f.write(why)
 
-    # Wrapped so a failing DM (revoked alert token, Telegram rate limit)
-    # can't stop the channel escalation below from being evaluated.
-    try:
-        send(
-            f"⚠️ <b>TRACKER DOWN</b> — {why}.\n"
-            f"Retrying automatically — I'll confirm once it's back.\n\n"
-            f"<pre>{html.escape(logs[-1200:]) or 'no details available'}</pre>"
-        )
-    except Exception as e:
-        print(f"[ALERT] DM failed: {e}", file=sys.stderr)
-
-    escalate_if_still_down()
+    state = _load_state()
+    now = datetime.now(timezone.utc)
+    if _due(state.get("last_dm"), now, _DM_COOLDOWN):
+        try:
+            send(
+                f"⚠️ <b>TRACKER DOWN</b> — {why}.\n"
+                f"Retrying automatically — I'll confirm once it's back.\n\n"
+                f"<pre>{html.escape(logs[-1200:]) or 'no details available'}</pre>"
+            )
+            state["last_dm"] = now.isoformat()
+            with open(_STATE, "w") as f:
+                json.dump(state, f)
+        except Exception as e:
+            print(f"[ALERT] DM failed: {e}", file=sys.stderr)
 
 
 if __name__ == "__main__":
