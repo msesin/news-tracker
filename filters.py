@@ -17,10 +17,29 @@ _last_call_time = 0.0
 _MIN_INTERVAL = 5.0
 _LABEL_RE = re.compile(r"^\s*line\s*\d+\s*:\s*", re.I)
 
-# A 429 already survives up to 2 in-call retries with backoff before giving
-# up; other errors (bad key, network drop, model unavailable) don't retry
-# at all. Requiring 2 separate failed calls before alerting avoids a false
-# alarm from one non-429 blip, while still catching a real outage fast.
+# Transient provider errors survive up to 2 in-call retries with backoff before
+# giving up; permanent ones (bad key, malformed request) don't retry at all,
+# since retrying them only burns quota. Requiring 2 separate failed calls before
+# alerting avoids a false alarm from one blip, while still catching a real
+# outage fast.
+#
+# 503 UNAVAILABLE is the provider saying "too much demand right now, try again"
+# — its own message calls the spike temporary. It used to fall through to the
+# no-retry branch alongside genuinely permanent failures, so a 503 burned the
+# post immediately: one call, logged NO unreviewed, no second attempt. It is
+# retried on a shorter backoff than 429, because a demand spike clears in
+# seconds while a rate limit has a fixed window to wait out.
+_RETRYABLE = ("429", "503", "UNAVAILABLE", "500", "INTERNAL", "502", "504", "DEADLINE_EXCEEDED")
+
+
+def _is_retryable(err: str) -> bool:
+    return any(code in err for code in _RETRYABLE)
+
+
+def _backoff_seconds(err: str, attempt: int) -> int:
+    """429 waits out a rate-limit window; everything else is a demand spike."""
+    return 60 * (attempt + 1) if "429" in err else 5 * (attempt + 1)
+
 _LLM_ERROR_ALERT_THRESHOLD = 2
 _consecutive_llm_errors = 0
 _llm_error_alerted = False
@@ -38,6 +57,69 @@ _llm_error_alerted = False
 _LLM_CHANNEL_ALERT_AFTER = 15 * 60
 _llm_outage_since: datetime | None = None
 _llm_channel_alerted = False
+
+# Recovery used to be discovered only by handing the classifier a real post:
+# _note_llm_success() runs inside llm_classify(), and llm_classify() only runs
+# for a post that already cleared keyword_match(). On a quiet stretch the API
+# could come back within a minute and nobody would be told for hours, because
+# no qualifying post arrived to prove it. The same coupling delayed the
+# channel-facing notice in the other direction.
+#
+# So while an outage is open, a background thread probes the API on its own.
+# The cost objection that ruled this out before only applies while healthy —
+# once we know we are down, real posts are not consuming quota anyway, and one
+# short call every few minutes is cheap next to silently logging posts NO.
+_PROBE_INTERVAL = 60
+_PROBE_TEXT = "ping"
+_probe_thread: threading.Thread | None = None
+_probe_stop = threading.Event()
+
+
+def _probe_once() -> bool:
+    """One bare API call. Returns True if the classifier answers at all."""
+    try:
+        _client.models.generate_content(model=_MODEL, contents=_PROBE_TEXT)
+        return True
+    except Exception as e:
+        print(f"[LLM] probe still failing: {str(e)[:120]}")
+        return False
+
+
+def _probe_loop() -> None:
+    while not _probe_stop.wait(_PROBE_INTERVAL):
+        # The channel clock has to keep running here too. Previously it was
+        # only evaluated on a failed classification, so a silent outage could
+        # outlive the 15-minute bar without the channel ever being told.
+        _maybe_alert_channel_outage()
+        if _probe_once():
+            print("[LLM] probe succeeded — classifier is back")
+            _note_llm_success()
+            return
+
+
+def _start_probe() -> None:
+    global _probe_thread
+    if _probe_thread is not None and _probe_thread.is_alive():
+        return
+    _probe_stop.clear()
+    _probe_thread = threading.Thread(target=_probe_loop, name="llm-probe", daemon=True)
+    _probe_thread.start()
+
+
+def _maybe_alert_channel_outage() -> None:
+    """Tell the channel once the outage passes the 15-minute bar. Split out of
+    _note_llm_failure() so the probe thread can apply the same rule without a
+    post having to arrive."""
+    global _llm_channel_alerted
+    if _llm_channel_alerted or _llm_outage_since is None:
+        return
+    if (datetime.now(timezone.utc) - _llm_outage_since).total_seconds() < _LLM_CHANNEL_ALERT_AFTER:
+        return
+    _llm_channel_alerted = True
+    try:
+        send_text(CHANNEL_DOWN_MESSAGE)
+    except Exception as e:
+        print(f"[LLM] failed to send channel outage notice: {e}")
 
 # Kept in sync with the wording used in healthchecks.io's webhook integration
 # (see README) — same message either way, whether the tracker is fully down
@@ -147,6 +229,7 @@ def keyword_match(text: str) -> bool:
 
 def _note_llm_success() -> None:
     global _consecutive_llm_errors, _llm_error_alerted, _llm_outage_since, _llm_channel_alerted
+    _probe_stop.set()          # whichever path got here first, the probe is done
     _consecutive_llm_errors = 0
     # Any success means the API is not down — a real outage never has one of
     # these in the middle of it. Reset the wall-clock immediately, so a flaky
@@ -184,13 +267,12 @@ def _note_llm_failure(reason: str) -> None:
         except Exception as e:
             print(f"[LLM] failed to send failure alert: {e}")
 
-    if (not _llm_channel_alerted
-            and (now - _llm_outage_since).total_seconds() >= _LLM_CHANNEL_ALERT_AFTER):
-        _llm_channel_alerted = True
-        try:
-            send_text(CHANNEL_DOWN_MESSAGE)
-        except Exception as e:
-            print(f"[LLM] failed to send channel outage notice: {e}")
+    _maybe_alert_channel_outage()
+
+    # From here the probe watches for recovery, so it no longer takes a
+    # qualifying post to notice the API is back — or to reach the 15-minute
+    # channel bar while nothing is arriving.
+    _start_probe()
 
 
 def llm_classify(text: str, channel: str) -> tuple[bool, str]:
@@ -219,9 +301,10 @@ def llm_classify(text: str, channel: str) -> tuple[bool, str]:
             _note_llm_success()
             return decision, reason
         except Exception as e:
-            if "429" in str(e) and attempt < 2:
-                wait_time = 60 * (attempt + 1)
-                print(f"[WAIT] rate limited, retrying in {wait_time}s...")
+            err = str(e)
+            if _is_retryable(err) and attempt < 2:
+                wait_time = _backoff_seconds(err, attempt)
+                print(f"[WAIT] transient LLM error, retrying in {wait_time}s...")
                 time.sleep(wait_time)
                 continue
             error_reason = f"LLM error: {e}"
