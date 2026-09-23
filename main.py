@@ -7,7 +7,9 @@ from telethon import TelegramClient, events, utils
 from config import TELEGRAM_API_ID, TELEGRAM_API_HASH, HEALTHCHECK_URL
 from channels import CHANNELS
 from filters import keyword_match, llm_classify
-from storage import init_db, log_decision, is_duplicate, mark_seen
+from storage import (init_db, log_decision, is_duplicate, mark_seen,
+                     park_post, pending_posts, pending_count, unpark,
+                     note_park_attempt, MAX_PARK_ATTEMPTS)
 from notifier import send_notification, send_alert
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -16,6 +18,7 @@ _BOOT_ID_FILE = os.path.join(_HERE, ".boot_id")
 
 SESSION_FILE = "news_tracker"
 PING_INTERVAL = 300
+DRAIN_INTERVAL = 60
 
 client = TelegramClient(SESSION_FILE, TELEGRAM_API_ID, TELEGRAM_API_HASH)
 
@@ -65,6 +68,71 @@ async def resolve_channels():
         except Exception as e:
             print(f"  FAIL  {ch['name']:25s}  @{ch['username']}  — {e}")
     return resolved
+
+
+async def _publish(loop, channel_name, username, event_id, text, late=False):
+    """Send one YES post to the channel. Shared by the live handler and the
+    drain, so a post rescued from the parking table is delivered by exactly
+    the same path as one classified on arrival."""
+    if is_duplicate(text):
+        print(f"[DUP ] [{channel_name}] skipping notification — seen in last 24h")
+        return
+    mark_seen(text)
+    await loop.run_in_executor(
+        None, send_notification, channel_name, username, event_id, text
+    )
+    print(f"[SENT] [{channel_name}] notification delivered{' (late)' if late else ''}")
+
+
+async def drain_pending(loop: asyncio.AbstractEventLoop) -> None:
+    """Replay posts the classifier never judged, once it answers again.
+
+    Retries inside llm_classify() cover about ninety seconds. Anything longer
+    and the post lands here instead of being logged NO unreviewed. A successful
+    classification here also resolves the outage the normal way, since
+    llm_classify() reports its own success — so the first rescued post can be
+    what triggers the recovery notices, with no post needing to arrive live."""
+    while True:
+        await asyncio.sleep(DRAIN_INTERVAL)
+        parked = pending_posts()
+        if not parked:
+            continue
+
+        print(f"[DRAIN] {len(parked)} parked post(s) — retrying")
+        for post_id, channel_name, text, _attempts in parked:
+            decision, reason = await loop.run_in_executor(
+                None, llm_classify, text, channel_name
+            )
+
+            if reason.startswith("LLM error:"):
+                attempts = await loop.run_in_executor(None, note_park_attempt, post_id)
+                if attempts >= MAX_PARK_ATTEMPTS:
+                    # Not an outage any more - this specific post fails every
+                    # time. Drop it rather than retry it on every recovery
+                    # forever, and say so, since it is a post nobody judged.
+                    await loop.run_in_executor(None, unpark, post_id)
+                    log_decision(channel_name, text, False, f"dropped after {attempts} attempts: {reason}")
+                    try:
+                        await loop.run_in_executor(
+                            None, send_alert,
+                            f"⚠️ <b>Post could not be classified</b> after {attempts} attempts "
+                            f"in {html.escape(channel_name)} — dropped without review.\n\n"
+                            f"<pre>{html.escape(text[:300])}</pre>")
+                    except Exception as e:
+                        print(f"[DRAIN] alert failed: {e}")
+                else:
+                    print(f"[DRAIN] still failing ({attempts}/{MAX_PARK_ATTEMPTS}) — leaving parked")
+                    break          # classifier is still down; stop the pass
+                continue
+
+            await loop.run_in_executor(None, unpark, post_id)
+            log_decision(channel_name, text, decision, f"(late) {reason}")
+            print(f"[{'YES ' if decision else 'NO  '}] [{channel_name}] (late) {reason}")
+            if decision:
+                try:
+                    await _publish(loop, channel_name, "", 0, text, late=True)
+                except Exception as e:
+                    print(f"[DRAIN] publish failed: {e}")
 
 
 async def healthcheck_ping(loop: asyncio.AbstractEventLoop) -> None:
@@ -141,6 +209,7 @@ async def main():
 
     loop = asyncio.get_event_loop()
     asyncio.create_task(healthcheck_ping(loop))
+    asyncio.create_task(drain_pending(loop))
 
     @client.on(events.NewMessage(chats=list(channel_map.keys())))
     async def handler(event):
@@ -157,6 +226,14 @@ async def main():
         decision, reason = await loop.run_in_executor(
             None, llm_classify, text, channel_name
         )
+
+        # A post the classifier never judged is parked, not discarded. Logging
+        # it NO here would be recording a verdict nobody reached.
+        if reason.startswith("LLM error:"):
+            await loop.run_in_executor(None, park_post, channel_name, text)
+            print(f"[PARK] [{channel_name}] classifier unavailable — parked for retry | {preview}")
+            return
+
         log_decision(channel_name, text, decision, reason)
 
         label = "YES " if decision else "NO  "

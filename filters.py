@@ -27,8 +27,14 @@ _LABEL_RE = re.compile(r"^\s*line\s*\d+\s*:\s*", re.I)
 # — its own message calls the spike temporary. It used to fall through to the
 # no-retry branch alongside genuinely permanent failures, so a 503 burned the
 # post immediately: one call, logged NO unreviewed, no second attempt. It is
-# retried on a shorter backoff than 429, because a demand spike clears in
-# seconds while a rate limit has a fixed window to wait out.
+# retried on its own schedule, separate from 429's.
+#
+# The waits are deliberately long. A demand spike that clears in five seconds
+# would not have produced an alert in the first place; the outages worth
+# retrying through last minutes, and three attempts crammed into fifteen
+# seconds just fail three times and burn the post. 30s then 60s buys a post
+# ninety seconds of outage tolerance instead of fifteen. Anything longer than
+# that is the parking table's job, not the retry loop's.
 _RETRYABLE = ("429", "503", "UNAVAILABLE", "500", "INTERNAL", "502", "504", "DEADLINE_EXCEEDED")
 
 
@@ -37,8 +43,8 @@ def _is_retryable(err: str) -> bool:
 
 
 def _backoff_seconds(err: str, attempt: int) -> int:
-    """429 waits out a rate-limit window; everything else is a demand spike."""
-    return 60 * (attempt + 1) if "429" in err else 5 * (attempt + 1)
+    """429 waits out a rate-limit window; everything else rides out a spike."""
+    return 60 * (attempt + 1) if "429" in err else 30 * (attempt + 1)
 
 _LLM_ERROR_ALERT_THRESHOLD = 2
 _consecutive_llm_errors = 0
