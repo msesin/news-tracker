@@ -41,11 +41,15 @@ flowchart LR
    keyword pre-filter, and response parsing don't change.
 4. **Deduplicate** — [`storage.py`](storage.py) hashes the post and skips anything
    already seen in the last 24 hours, since breaking news gets reposted across channels.
-5. **Publish** — [`notifier.py`](notifier.py) posts an excerpt plus a link to the
-   original into the destination channel, via a bot.
+5. **Publish** — [`notifier.py`](notifier.py) posts an excerpt, the post's original
+   timestamp (always labeled "за Києвом" — Kyiv time, regardless of the server's own
+   timezone), and a link to the original, into the destination channel, via a bot.
 
-Every decision (YES and NO, with the model's reasoning) is logged to a local SQLite
-database, so the filter's behaviour can be audited after the fact.
+Every LLM decision (YES and NO, with the model's reasoning) is logged to a local SQLite
+database, so the classifier's behaviour can be audited after the fact. Posts stopped
+earlier, at the keyword-filter stage, never reach this table — they only ever show up as
+a `[SKIP]` line in `journalctl`/stdout, so "why wasn't this post in `decisions.db`" is
+often answered by "it never reached the classifier" rather than by a classifier mistake.
 
 ## Staying alive
 
@@ -217,7 +221,7 @@ asyncio.create_task(daily_heartbeat(loop))
 |---|---|
 | [`main.py`](main.py) | Event loop, message handler, healthcheck ping |
 | [`channels.py`](channels.py) | The list of monitored source channels |
-| [`filters.py`](filters.py) | Keyword list, LLM prompt, rate limiter |
+| [`filters.py`](filters.py) | Keyword list, LLM prompt, rate limiter, LLM-outage alerts |
 | [`storage.py`](storage.py) | SQLite decision log and 24h deduplication |
 | [`notifier.py`](notifier.py) | Sends channel posts and alert DMs |
 | [`alert_failure.py`](alert_failure.py) | Failure alert, run by systemd on every non-clean stop |
@@ -263,6 +267,11 @@ To route its alerts through your own alert bot, add a webhook integration with m
 ```
 https://api.telegram.org/bot<ALERT_BOT_TOKEN>/sendMessage?chat_id=<ALERT_CHAT_ID>&text=$NAME%20is%20$STATUS
 ```
+
+This gives you the private DM side. Also add a **second** integration on the same check
+so subscribers learn about a real outage too — see "Setting up the channel webhook" under
+[Staying alive](#staying-alive) for its exact request bodies. Easy to miss if you only do
+the first one: the two are independent, and neither implies the other.
 
 **5. Configure and install:**
 
@@ -311,6 +320,15 @@ The unit files assume the project lives at `/home/ubuntu/news-tracker` and runs 
 already in the `adm` group, which grants it. It only sends a message when the stop was
 not a deliberate `systemctl stop` (checked via systemd's `$SERVICE_RESULT`).
 
+Also enable persistent journal storage, so the recovery DM has a previous-boot log to
+read from after a real server reboot (see [Staying alive](#staying-alive) for why this
+matters — it's the one detail `alert_failure.py` can't cover on its own):
+
+```bash
+sudo mkdir -p /var/log/journal
+sudo systemctl restart systemd-journald
+```
+
 ## Updating
 
 ```bash
@@ -335,7 +353,12 @@ untouched.
 | `LLM_API_KEY` | API key for your chosen LLM provider (this repo ships configured for Google Gemini) |
 
 Tuning knobs live at the top of their modules: `KEYWORDS` and the prompt in `filters.py`,
-`PING_INTERVAL` in `main.py`, and the monitored channel list in `channels.py`.
+`PING_INTERVAL` in `main.py`, and the monitored channel list in `channels.py`. Also in
+`filters.py`: `_LLM_CHANNEL_ALERT_AFTER` (the 15-minute threshold for the LLM-outage
+channel post) and `CHANNEL_DOWN_MESSAGE`/`CHANNEL_UP_MESSAGE` (the channel wording — keep
+these in sync with the healthchecks.io webhook's request bodies, since nothing wires the
+two together automatically). In `alert_failure.py`: `_DM_COOLDOWN` (minimum gap between
+TRACKER DOWN DMs during a crash loop).
 
 ## License
 

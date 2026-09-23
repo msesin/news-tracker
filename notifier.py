@@ -27,7 +27,9 @@ _MONTHS_GENITIVE = {
 
 def _format_kyiv(timestamp: datetime) -> str:
     local = timestamp.astimezone(_KYIV)
-    return f"{local.day} {_MONTHS_GENITIVE[local.month]}, {local.strftime('%H:%M')}"
+    # Spelled out rather than assumed: a subscriber reading this outside
+    # Ukraine has no other way to know which timezone the timestamp is in.
+    return f"{local.day} {_MONTHS_GENITIVE[local.month]}, {local.strftime('%H:%M')} (за Києвом)"
 
 
 def send_notification(
