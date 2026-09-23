@@ -1,6 +1,7 @@
 import asyncio
 import html
 import os
+import subprocess
 import requests
 from telethon import TelegramClient, events, utils
 from config import TELEGRAM_API_ID, TELEGRAM_API_HASH, HEALTHCHECK_URL
@@ -9,12 +10,43 @@ from filters import keyword_match, llm_classify
 from storage import init_db, log_decision, is_duplicate, mark_seen
 from notifier import send_notification, send_alert
 
-_FAILURE_MARKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".last_failure")
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_FAILURE_MARKER = os.path.join(_HERE, ".last_failure")
+_BOOT_ID_FILE = os.path.join(_HERE, ".boot_id")
 
 SESSION_FILE = "news_tracker"
 PING_INTERVAL = 300
 
 client = TelegramClient(SESSION_FILE, TELEGRAM_API_ID, TELEGRAM_API_HASH)
+
+
+def _current_boot_id() -> str | None:
+    """The kernel's own ID for this boot session — changes on every reboot,
+    including a crash of the OS itself, unlike a mere process restart under
+    the same kernel. Not available outside Linux (e.g. local development on
+    macOS), so the reboot-detection below quietly does nothing there instead
+    of failing."""
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def _previous_boot_tail(lines: int = 20) -> str:
+    """Best-effort tail of the log from the boot *before* this one — whatever
+    the kernel/journald managed to write right up to the crash or shutdown.
+    Empty if persistent journal storage isn't enabled on this box (the
+    default on some minimal server images — see README), which the caller
+    must treat as "no forensic detail available", not as an error."""
+    try:
+        result = subprocess.run(
+            ["journalctl", "-b", "-1", "-n", str(lines), "--no-pager"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return result.stdout.strip()
+    except Exception as e:
+        return f"(не вдалося прочитати журнал попереднього завантаження: {e})"
 
 
 async def resolve_channels():
@@ -57,15 +89,49 @@ async def main():
     await client.start()
     print("\nLogged in successfully.\n")
 
-    # If the last run ended in a real failure (written by alert_failure.py),
-    # confirm recovery now instead of waiting on healthchecks.io, which
-    # won't notice a crash-and-restart faster than its detection window.
+    # Two independent, and independently optional, signals of "something
+    # happened while we were away" — combined into one DM so an outage that
+    # was both an app crash and a reboot doesn't produce two confusing
+    # messages:
+    #  - .last_failure: alert_failure.py saw the process itself die (written
+    #    via ExecStopPost=, which only runs if the OS stayed up long enough
+    #    to run it) — confirms recovery sooner than healthchecks.io's ~15 min
+    #    detection window would.
+    #  - boot id change: the OS itself restarted since our last successful
+    #    start — the one case alert_failure.py structurally can't report,
+    #    since a dead OS can't run ExecStopPost= to explain its own death.
+    #    This is the detail a total-server-outage recovery previously had
+    #    none of.
+    parts = []
+
     if os.path.exists(_FAILURE_MARKER):
         with open(_FAILURE_MARKER) as f:
             cause = f.read().strip()
         os.remove(_FAILURE_MARKER)
+        parts.append(f"<b>Процес:</b> {html.escape(cause)}")
+
+    current_boot = _current_boot_id()
+    if current_boot is not None:
+        previous_boot = None
+        if os.path.exists(_BOOT_ID_FILE):
+            with open(_BOOT_ID_FILE) as f:
+                previous_boot = f.read().strip()
+        with open(_BOOT_ID_FILE, "w") as f:
+            f.write(current_boot)
+
+        # No previous_boot means this is the first run since this feature was
+        # deployed — nothing to compare against, so say nothing rather than
+        # imply a reboot that we have no actual evidence of.
+        if previous_boot and previous_boot != current_boot:
+            tail = _previous_boot_tail()
+            detail = (f"<pre>{html.escape(tail[-1000:])}</pre>" if tail
+                      else "(журнал попереднього завантаження порожній або недоступний — "
+                           "можливо, на сервері не увімкнено persistent journal storage)")
+            parts.append(f"<b>Сервер перезавантажився.</b> Останні рядки журналу перед цим:\n{detail}")
+
+    if parts:
         try:
-            send_alert(f"✅ <b>Back to normal</b> — recovered from: {html.escape(cause)}")
+            send_alert("✅ <b>Back to normal</b>\n\n" + "\n\n".join(parts))
         except Exception as e:
             print(f"[RECOVERY] failed to send recovery alert: {e}")
 

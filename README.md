@@ -108,6 +108,40 @@ but silently disconnected from Telegram still trips the alarm instead of looking
 Alerts go to a **separate bot** in a private DM, keeping operational noise out of the
 public channel.
 
+### What the recovery DM actually tells you
+
+The generic "X is down" / "X is up" messages healthchecks.io sends itself carry no detail
+beyond that — it only ever sees ping silence, never *why* the pings stopped, so no amount
+of configuration on its side can add a cause. Anything more specific has to come from
+inside the process, which means it can only exist for failures the process survives to
+report on. [`main.py`](main.py) combines two such sources into a single "Back to normal"
+DM on its next successful start:
+
+- **The process crashed, OS stayed up** — `.last_failure`, written by `alert_failure.py`
+  (see above). Reports the same cause already sent in the TRACKER DOWN DM.
+- **The server itself rebooted** — detected by comparing `/proc/sys/kernel/random/boot_id`
+  against the value saved on the previous run (`.boot_id`). A changed boot ID means the
+  kernel restarted, not just the tracker process — the one outage `alert_failure.py`
+  can't report on, since a dead OS never gets to run `ExecStopPost=` and explain itself.
+  When detected, `main.py` also pulls the last 20 lines of `journalctl -b -1` — the log
+  from the boot *before* this one, i.e. whatever the kernel managed to write on its way
+  down (OOM-killer, kernel panic, a clean shutdown request, …).
+
+If both happened in the same outage, one DM reports both rather than sending two.
+
+**This needs persistent journal storage to say anything for the reboot case.** Ubuntu's
+default is often volatile storage (`/run/log/journal`), which is wiped on every reboot —
+so by the time the tracker restarts, the very log it wants to read is already gone, and
+the DM says so explicitly instead of silently omitting the section. To enable it:
+
+```bash
+sudo mkdir -p /var/log/journal
+sudo systemctl restart systemd-journald
+```
+
+Do this once, before you need it — it can't retroactively recover logs from before it was
+enabled.
+
 ### A simpler alternative: daily heartbeat
 
 An earlier version of this project skipped all of the above and just had the bot send a
@@ -171,7 +205,7 @@ asyncio.create_task(daily_heartbeat(loop))
 |---|---|---|---|
 | ⚠️ Update may be missed | A relevant post was found but publishing it to the channel failed | [`main.py`](main.py)'s handler, when `send_notification()` raises (bot lost admin/post rights, channel deleted, network blip, rate limit) | The alert links directly to the missed post. Then check `journalctl -u news-tracker -n 50 --no-pager` around that time; verify the news bot is still an admin with *Post Messages*. |
 | ⚠️ TRACKER DOWN *(DM only)* | The whole process crashed or was killed | systemd's `ExecStopPost=` running [`alert_failure.py`](alert_failure.py) whenever `$SERVICE_RESULT != "success"`, cooled down to at most once per 10 minutes per outage | The alert's log excerpt is often enough. Otherwise: `systemctl status news-tracker` for the exit code, `journalctl -u news-tracker -n 50 --no-pager` for the full traceback. |
-| ✅ Back to normal *(DM only)* | Recovered after a TRACKER DOWN | [`main.py`](main.py) at startup, if `.last_failure` exists | Nothing to do. If DOWN arrived but this never did, `systemctl status news-tracker` — it likely crashed again before finishing startup. |
+| ✅ Back to normal *(DM only)* | Recovered after a TRACKER DOWN, a server reboot, or both | [`main.py`](main.py) at startup — see "What the recovery DM actually tells you" below | Nothing to do. If DOWN arrived but this never did, `systemctl status news-tracker` — it likely crashed again before finishing startup. |
 | healthchecks.io "is down" / "is up" *(DM + posted to the channel)* | The server may be unreachable, or the process is frozen (not crashed — systemd still sees it as running, so TRACKER DOWN won't fire for this case) — or anything else that stops check-ins, including the whole server being gone | Missed check-ins for ~15 min (5 min period + 10 min grace); the channel side is the webhook integration set up above | If you can't SSH in at all, check the Oracle Cloud console first. If you can, look for `[PING] failed to reach healthchecks.io` in the logs — that points to connectivity to that one host, not a full outage. |
 | ⚠️ CLASSIFIER DOWN / ✅ Classifier recovered *(DM, fast)* | The LLM API is failing — the process itself is fine | [`filters.py`](filters.py), after 2 consecutive `llm_classify()` failures (not 1, since only 429s retry in-call) | `journalctl -u news-tracker \| grep "LLM error"`, or `sqlite3 decisions.db "select * from decisions where llm_reason like 'LLM error%' order by id desc limit 5;"`. For Gemini specifically, check quota/billing at aistudio.google.com — for another provider, check theirs. |
 | ⚠️/✅ Бот тимчасово не працює / Бот знову працює *(posted to the channel — LLM outage only)* | The same LLM outage as above has now lasted 15+ minutes measured from the first failure, so subscribers are told the channel's silence may not mean "no news" | [`filters.py`](filters.py)'s `_note_llm_failure()` / `_note_llm_success()` | You will already have a CLASSIFIER DOWN DM from when this started; debug from that — check Gemini's quota/billing dashboard. |

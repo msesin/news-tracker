@@ -9,3 +9,4 @@ decisions.db
 news-tracker.code-workspace
 .last_failure
 .downtime
+.boot_id
