@@ -6,7 +6,7 @@ import requests
 from telethon import TelegramClient, events, utils
 from config import TELEGRAM_API_ID, TELEGRAM_API_HASH, HEALTHCHECK_URL
 from channels import CHANNELS
-from filters import keyword_match, llm_classify
+from filters import keyword_match, llm_classify, classifier_healthy
 from storage import (init_db, log_decision, is_duplicate, mark_seen,
                      park_post, pending_posts, pending_count, unpark,
                      note_park_attempt, MAX_PARK_ATTEMPTS)
@@ -98,6 +98,14 @@ async def drain_pending(loop: asyncio.AbstractEventLoop) -> None:
         if not parked:
             continue
 
+        # Never replay into a classifier that is still down. Watching for
+        # recovery is the probe's job; a failure here while the API is out
+        # would be counted against the post, and five such passes would drop
+        # the post minutes into an outage it was parked to survive.
+        if not classifier_healthy():
+            print(f"[DRAIN] {len(parked)} parked, classifier still down — waiting")
+            continue
+
         print(f"[DRAIN] {len(parked)} parked post(s) — retrying")
         for post_id, channel_name, text, _attempts in parked:
             decision, reason = await loop.run_in_executor(
@@ -121,8 +129,12 @@ async def drain_pending(loop: asyncio.AbstractEventLoop) -> None:
                     except Exception as e:
                         print(f"[DRAIN] alert failed: {e}")
                 else:
-                    print(f"[DRAIN] still failing ({attempts}/{MAX_PARK_ATTEMPTS}) — leaving parked")
-                    break          # classifier is still down; stop the pass
+                    # Healthy classifier, yet this post failed - genuinely
+                    # post-specific, so the strike is earned. Stop the pass
+                    # anyway in case the API went down again mid-drain; the
+                    # next pass re-checks health before touching anything.
+                    print(f"[DRAIN] post failed ({attempts}/{MAX_PARK_ATTEMPTS}) — leaving parked")
+                    break
                 continue
 
             await loop.run_in_executor(None, unpark, post_id)

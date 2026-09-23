@@ -81,6 +81,15 @@ _probe_thread: threading.Thread | None = None
 _probe_stop = threading.Event()
 
 
+def classifier_healthy() -> bool:
+    """True when the last call we made was answered. The drain uses this to
+    avoid replaying a backlog into an API that is still down: a failure then
+    says nothing about the post, only about the outage, and counting it as a
+    strike against the post would throw away exactly the posts parking exists
+    to protect."""
+    return _consecutive_llm_errors == 0
+
+
 def _probe_once() -> bool:
     """One bare API call. Returns True if the classifier answers at all."""
     try:
