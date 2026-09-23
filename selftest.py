@@ -76,7 +76,7 @@ news = api(
     os.environ["NEWS_BOT_TOKEN"],
     "sendMessage",
     chat_id=int(os.environ["NEWS_CHAT_ID"]),
-    text="[TEST] Channel delivery works. Mobilization updates will arrive here.",
+    text="[ТЕСТ] Канал підключено. Сюди надходитимуть сповіщення про зміни правил.",
 )
 check(
     "news bot -> channel",
