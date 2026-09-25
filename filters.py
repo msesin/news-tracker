@@ -7,9 +7,30 @@ from google import genai
 from config import LLM_API_KEY
 from notifier import send_alert, send_text
 
-_MODEL = "gemini-3.1-flash-lite"
+# Tried in order until one answers. A 503 "high demand" is capacity on one
+# model, not the API as a whole: on 2026-09-24 gemini-3.1-flash-lite returned
+# 503 for about five hours straight, and a same-day test found other models
+# answering while it was busy. Free-tier rate limits are also per model, so a
+# 429 on one model is no reason to wait before asking the next.
+#
+# The order spreads the chain across generations and tiers, so the models are
+# unlikely to be saturated at the same moment: the primary, a Flash-Lite from
+# another generation, then full Flash models from older to newer — demand
+# piles onto the newest release, so it is the last resort. All are stable
+# endpoints; previews usually need billing, and the 2.5 models return 404 for
+# a key that hadn't used them before Google restricted access. Every model
+# here was checked against the real prompt and answered in the two-line
+# YES/NO format.
+_MODELS = (
+    "gemini-3.1-flash-lite",   # primary: cheapest and fastest
+    "gemini-3.5-flash-lite",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-3.7-flash",
+    "gemini-3.8-flash",
+)
 _client = genai.Client(api_key=LLM_API_KEY)
-print(f"[LLM] key={LLM_API_KEY[:8]}… model={_MODEL}")
+print(f"[LLM] key={LLM_API_KEY[:8]}… models={' → '.join(_MODELS)}")
 
 # Rate limiter: free tier = 15 RPM; 5 s gap → 12 RPM to avoid edge-of-window 429s
 _lock = threading.Lock()
@@ -90,9 +111,10 @@ def classifier_healthy() -> bool:
 
 
 def _probe_once() -> bool:
-    """One bare API call. Returns True if the classifier answers at all."""
+    """One bare request down the model chain. True if any model answers —
+    that is what "the classifier is back" means once there is a fallback."""
     try:
-        _client.models.generate_content(model=_MODEL, contents=_PROBE_TEXT)
+        _generate(_PROBE_TEXT)
         return True
     except Exception as e:
         print(f"[LLM] probe still failing: {str(e)[:120]}")
@@ -289,6 +311,32 @@ def _note_llm_failure(reason: str) -> None:
     _start_probe()
 
 
+def _generate(prompt: str) -> tuple[str, str]:
+    """Ask each model in _MODELS in turn, with no wait in between, and return
+    (response text, model) from the first that answers.
+
+    Any error moves on to the next model — busy, rate-limited, or even gone
+    (a model Google later shuts down returns 404 and is simply skipped). If
+    every model fails, the error raised is a retryable one when any model's
+    error was, so the caller backs off and tries the whole chain again rather
+    than giving up because the *last* model in line happened to fail
+    differently."""
+    errors = []
+    for model in _MODELS:
+        try:
+            response = _client.models.generate_content(model=model, contents=prompt)
+            if not (response.text or "").strip():
+                raise ValueError("empty response")
+            if errors:
+                print(f"[LLM] answered by fallback {model} after {len(errors)} busy model(s)")
+            return response.text, model
+        except Exception as e:
+            errors.append(str(e))
+            print(f"[LLM] {model} failed: {str(e)[:90]}")
+    representative = next((e for e in errors if _is_retryable(e)), errors[-1])
+    raise RuntimeError(f"all {len(_MODELS)} models failed; e.g. {representative}")
+
+
 def llm_classify(text: str, channel: str) -> tuple[bool, str]:
     global _last_call_time
     prompt = _PROMPT_TEMPLATE.format(channel=channel, text=text[:2000])
@@ -303,22 +351,22 @@ def llm_classify(text: str, channel: str) -> tuple[bool, str]:
 
     for attempt in range(3):
         try:
-            response = _client.models.generate_content(
-                model=_MODEL, contents=prompt
-            )
-            lines = response.text.strip().splitlines()
+            answer, model = _generate(prompt)
+            lines = answer.strip().splitlines()
             # The model intermittently echoes a "Line 1:"/"Line 2:" prefix; without
             # stripping it a YES parses as NO and the alert is silently dropped.
             verdict = _LABEL_RE.sub("", lines[0]).strip().upper()
             decision = verdict.startswith("YES")
             reason = _LABEL_RE.sub("", lines[1]).strip() if len(lines) > 1 else "(no reason)"
+            if model != _MODELS[0]:
+                reason = f"{reason} (via {model})"
             _note_llm_success()
             return decision, reason
         except Exception as e:
             err = str(e)
             if _is_retryable(err) and attempt < 2:
                 wait_time = _backoff_seconds(err, attempt)
-                print(f"[WAIT] transient LLM error, retrying in {wait_time}s...")
+                print(f"[WAIT] every model busy, retrying the chain in {wait_time}s...")
                 time.sleep(wait_time)
                 continue
             error_reason = f"LLM error: {e}"

@@ -38,12 +38,23 @@ flowchart LR
    **Gemini via Google AI Studio** (generous free tier), but the approach is
    provider-agnostic — any LLM API works identically, since it's just "send a prompt,
    parse a YES/NO answer." Swapping providers means replacing the client call in
-   `llm_classify()` ([`filters.py`](filters.py)) with that provider's SDK (OpenAI,
+   `_generate()` ([`filters.py`](filters.py)) with that provider's SDK (OpenAI,
    Anthropic Claude, a self-hosted model via Ollama, etc.) — the prompt template,
    keyword pre-filter, and response parsing don't change.
 
-   If the API errors, the post is **not** judged NO. Transient errors (429, 5xx,
-   `UNAVAILABLE`) are retried in-call — 429 after 60s/120s, the rest after 30s/60s —
+   Gemini's most common failure is a 503 "high demand" on one model while others
+   are fine, so the classifier uses an ordered chain of models (`_MODELS` in
+   [`filters.py`](filters.py)): `gemini-3.1-flash-lite` first, then
+   `gemini-3.5-flash-lite`, `gemini-3.6-flash`, `gemini-3.5-flash`, `gemini-3.7-flash`,
+   `gemini-3.8-flash`. Any error on one model moves straight on to the next with no
+   wait, and the first answer wins; the decision log notes `(via <model>)` whenever a
+   fallback answered. The chain mixes generations and tiers so its models are unlikely
+   to be saturated at once, with the newest Flash — where demand piles up — last.
+   Free-tier rate limits are per model, so the same chain also rides out a 429 on one
+   model.
+
+   If every model in the chain fails, the post is still **not** judged NO. The whole
+   chain is retried — after 60s/120s if rate-limited, otherwise 30s/60s —
    and a post that still can't be classified is **parked** in `decisions.db`
    (`pending_posts`) instead of logged. Once the classifier answers again, a drain
    loop in [`main.py`](main.py) replays every parked post through the classifier for
@@ -226,7 +237,7 @@ asyncio.create_task(daily_heartbeat(loop))
 | ⚠️ TRACKER DOWN *(DM only)* | The whole process crashed or was killed | systemd's `ExecStopPost=` running [`alert_failure.py`](alert_failure.py) whenever `$SERVICE_RESULT != "success"`, cooled down to at most once per 10 minutes per outage | The alert's log excerpt is often enough. Otherwise: `systemctl status news-tracker` for the exit code, `journalctl -u news-tracker -n 50 --no-pager` for the full traceback. |
 | ✅ Back to normal *(DM only)* | Recovered after a TRACKER DOWN, a server reboot, or both | [`main.py`](main.py) at startup — see "What the recovery DM actually tells you" below | Nothing to do. If DOWN arrived but this never did, `systemctl status news-tracker` — it likely crashed again before finishing startup. |
 | healthchecks.io "is down" / "is up" *(DM + posted to the channel)* | The server may be unreachable, or the process is frozen (not crashed — systemd still sees it as running, so TRACKER DOWN won't fire for this case) — or anything else that stops check-ins, including the whole server being gone | Missed check-ins for ~15 min (5 min period + 10 min grace); the channel side is the webhook integration set up above | If you can't SSH in at all, check the Oracle Cloud console first. If you can, look for `[PING] failed to reach healthchecks.io` in the logs — that points to connectivity to that one host, not a full outage. |
-| ⚠️ CLASSIFIER DOWN / ✅ Classifier recovered *(DM, fast)* | The LLM API is failing — the process itself is fine | [`filters.py`](filters.py), after 2 consecutive `llm_classify()` failures, each already retried in-call. Recovery comes from the first success — a real post or the once-a-minute probe | `journalctl -u news-tracker \| grep -E "LLM\|PARK\|DRAIN"` shows every failure, probe, park and replay with timestamps. `sqlite3 decisions.db "select count(*) from pending_posts;"` shows how many posts are waiting. For Gemini specifically, check quota/billing at aistudio.google.com — for another provider, check theirs. |
+| ⚠️ CLASSIFIER DOWN / ✅ Classifier recovered *(DM, fast)* | The LLM API is failing — the process itself is fine | [`filters.py`](filters.py), after 2 consecutive `llm_classify()` failures, each meaning *every* model in the chain failed, three rounds in a row. Recovery comes from the first success — a real post or the once-a-minute probe | `journalctl -u news-tracker \| grep -E "LLM\|PARK\|DRAIN"` shows every failure, probe, park and replay with timestamps. `sqlite3 decisions.db "select count(*) from pending_posts;"` shows how many posts are waiting. For Gemini specifically, check quota/billing at aistudio.google.com — for another provider, check theirs. |
 | ⚠️/✅ Бот тимчасово не працює / Бот знову працює *(posted to the channel — LLM outage only)* | The same LLM outage as above has now lasted 15+ minutes measured from the first failure, so subscribers are told the channel's silence may not mean "no news" | [`filters.py`](filters.py)'s `_maybe_alert_channel_outage()` (from a failed classification or the probe) / `_note_llm_success()` | You will already have a CLASSIFIER DOWN DM from when this started; debug from that — check Gemini's quota/billing dashboard. |
 | ⚠️ Post could not be classified *(DM only)* | A parked post failed 5 times even though the classifier was healthy each time — something about that post, not the provider — and was dropped unreviewed | [`main.py`](main.py)'s `drain_pending()` | The DM quotes the post; read it yourself. `journalctl -u news-tracker \| grep DRAIN` shows each attempt's error. |
 | Channel resolution `FAIL` *(log only — no alert)* | A monitored channel couldn't be resolved at startup (renamed, deleted, or account removed from it) | [`main.py`](main.py)'s `resolve_channels()`, once per start | `journalctl -u news-tracker \| grep FAIL` right after a restart. Not wired to an alert — it only affects that one channel, silently, for the rest of that run, so check this manually after any restart or if a source channel seems to have gone quiet. |
@@ -374,7 +385,9 @@ Tuning knobs live at the top of their modules: `KEYWORDS` and the prompt in `fil
 channel post) and `CHANNEL_DOWN_MESSAGE`/`CHANNEL_UP_MESSAGE` (the channel wording — keep
 these in sync with the healthchecks.io webhook's request bodies, since nothing wires the
 two together automatically). In `alert_failure.py`: `_DM_COOLDOWN` (minimum gap between
-TRACKER DOWN DMs during a crash loop). For outages: `_RETRYABLE` and `_backoff_seconds()`
+TRACKER DOWN DMs during a crash loop). For outages: `_MODELS` (the fallback chain and its
+order — only add models you have checked return the two-line YES/NO format),
+`_RETRYABLE` and `_backoff_seconds()`
 (which errors are retried in-call, and how long each wait is) and `_PROBE_INTERVAL` in
 `filters.py`; `DRAIN_INTERVAL` in `main.py`; `MAX_PARK_ATTEMPTS` in `storage.py`.
 
