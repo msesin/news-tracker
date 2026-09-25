@@ -56,10 +56,9 @@ _llm_error_alerted = False
 # watches for a heartbeat, and this failure doesn't stop the heartbeat. So this
 # is the one channel-facing outage notice that has to come from inside the
 # process rather than from an external ping. It uses the same 15-minute bar as
-# the dead man's switch, but measured differently by necessity: this is only
-# ever checked when a post actually reaches the classifier, so on a quiet day
-# with no matching posts, an outage can go undetected past 15 minutes — there's
-# no free way to poll the LLM just to test it without spending quota on it.
+# the dead man's switch, measured from the first failure. The bar is checked
+# on every failed classification and, once an outage has started, every
+# minute by the probe below — so it fires on time even if no post arrives.
 _LLM_CHANNEL_ALERT_AFTER = 15 * 60
 _llm_outage_since: datetime | None = None
 _llm_channel_alerted = False
@@ -276,8 +275,8 @@ def _note_llm_failure(reason: str) -> None:
         try:
             send_alert(
                 f"⚠️ <b>CLASSIFIER DOWN</b> — {html.escape(reason)}.\n"
-                f"Posts are being logged as NO without real review — "
-                f"you may be missing updates."
+                f"Matching posts are being parked and will be classified "
+                f"automatically once it recovers — expect them late, not lost."
             )
         except Exception as e:
             print(f"[LLM] failed to send failure alert: {e}")

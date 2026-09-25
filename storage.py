@@ -31,13 +31,27 @@ def init_db():
         # makes them survive the restart that clears every in-process flag.
         conn.execute("""
             CREATE TABLE IF NOT EXISTS pending_posts (
-                id        INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT NOT NULL,
-                channel   TEXT NOT NULL,
-                text      TEXT NOT NULL,
-                attempts  INTEGER NOT NULL DEFAULT 0
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp  TEXT NOT NULL,
+                channel    TEXT NOT NULL,
+                text       TEXT NOT NULL,
+                attempts   INTEGER NOT NULL DEFAULT 0,
+                username   TEXT NOT NULL DEFAULT '',
+                message_id INTEGER NOT NULL DEFAULT 0,
+                posted_at  TEXT
             )
         """)
+        # A rescued post is published exactly like a live one, so it needs the
+        # same three things a live post has: where it came from (username +
+        # message_id, for the "read the full post" link) and when it was
+        # originally posted. The first version of this table stored none of
+        # them; add them to any table created before that was fixed.
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(pending_posts)")}
+        for column, ddl in (("username", "TEXT NOT NULL DEFAULT ''"),
+                            ("message_id", "INTEGER NOT NULL DEFAULT 0"),
+                            ("posted_at", "TEXT")):
+            if column not in existing:
+                conn.execute(f"ALTER TABLE pending_posts ADD COLUMN {column} {ddl}")
 
 
 def log_decision(channel: str, text: str, decision: bool, reason: str):
@@ -84,20 +98,29 @@ def mark_seen(text: str):
 MAX_PARK_ATTEMPTS = 5
 
 
-def park_post(channel: str, text: str) -> None:
+def park_post(channel: str, username: str, message_id: int,
+              posted_at: datetime, text: str) -> None:
     """Hold a post the classifier could not judge, for a retry after recovery."""
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
-            "INSERT INTO pending_posts (timestamp, channel, text) VALUES (?, ?, ?)",
-            (datetime.now(timezone.utc).isoformat(), channel, text),
+            "INSERT INTO pending_posts (timestamp, channel, username, message_id, posted_at, text) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (datetime.now(timezone.utc).isoformat(), channel, username, message_id,
+             posted_at.isoformat(), text),
         )
 
 
-def pending_posts() -> list[tuple[int, str, str, int]]:
+def pending_posts() -> list[tuple[int, str, str, int, datetime, str, int]]:
+    """(id, channel, username, message_id, posted_at, text, attempts), oldest first.
+    posted_at falls back to the time the post was parked for rows written
+    before the original post time was stored."""
     with sqlite3.connect(DB_PATH) as conn:
-        return conn.execute(
-            "SELECT id, channel, text, attempts FROM pending_posts ORDER BY id"
+        rows = conn.execute(
+            "SELECT id, channel, username, message_id, COALESCE(posted_at, timestamp), "
+            "text, attempts FROM pending_posts ORDER BY id"
         ).fetchall()
+    return [(i, ch, u, m, datetime.fromisoformat(t), text, a)
+            for i, ch, u, m, t, text, a in rows]
 
 
 def pending_count() -> int:

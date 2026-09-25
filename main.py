@@ -70,18 +70,37 @@ async def resolve_channels():
     return resolved
 
 
-async def _publish(loop, channel_name, username, event_id, text, late=False):
-    """Send one YES post to the channel. Shared by the live handler and the
-    drain, so a post rescued from the parking table is delivered by exactly
-    the same path as one classified on arrival."""
+async def _publish(loop, channel_name, username, message_id, posted_at, text, late=False):
+    """Send one YES post to the channel, or DM that it couldn't be sent.
+
+    The one publishing path for both the live handler and the drain, so a post
+    rescued from the parking table is delivered — and fails — exactly like one
+    classified on arrival. It previously wasn't shared: the drain had its own
+    copy that passed send_notification() the wrong arguments, so every rescued
+    YES was logged, marked seen, and then silently never sent."""
     if is_duplicate(text):
         print(f"[DUP ] [{channel_name}] skipping notification — seen in last 24h")
         return
     mark_seen(text)
-    await loop.run_in_executor(
-        None, send_notification, channel_name, username, event_id, text
-    )
-    print(f"[SENT] [{channel_name}] notification delivered{' (late)' if late else ''}")
+    suffix = " (late)" if late else ""
+    try:
+        await loop.run_in_executor(
+            None, send_notification, channel_name, username, message_id, posted_at, text
+        )
+        print(f"[SENT] [{channel_name}] notification delivered{suffix}")
+    except Exception as e:
+        print(f"[ERR ] [{channel_name}] notification failed{suffix}: {e}")
+        try:
+            await loop.run_in_executor(
+                None,
+                send_alert,
+                f"⚠️ <b>Update may be missed</b> — publish failed for "
+                f"{html.escape(channel_name)}{suffix}.\n\n"
+                f'<a href="{html.escape(f"https://t.me/{username}/{message_id}")}">Read it directly →</a>\n\n'
+                f"Monitoring continues normally.",
+            )
+        except Exception as alert_error:
+            print(f"[ERR ] alert delivery also failed: {alert_error}")
 
 
 async def drain_pending(loop: asyncio.AbstractEventLoop) -> None:
@@ -107,7 +126,7 @@ async def drain_pending(loop: asyncio.AbstractEventLoop) -> None:
             continue
 
         print(f"[DRAIN] {len(parked)} parked post(s) — retrying")
-        for post_id, channel_name, text, _attempts in parked:
+        for post_id, channel_name, username, message_id, posted_at, text, _attempts in parked:
             decision, reason = await loop.run_in_executor(
                 None, llm_classify, text, channel_name
             )
@@ -141,10 +160,8 @@ async def drain_pending(loop: asyncio.AbstractEventLoop) -> None:
             log_decision(channel_name, text, decision, f"(late) {reason}")
             print(f"[{'YES ' if decision else 'NO  '}] [{channel_name}] (late) {reason}")
             if decision:
-                try:
-                    await _publish(loop, channel_name, "", 0, text, late=True)
-                except Exception as e:
-                    print(f"[DRAIN] publish failed: {e}")
+                await _publish(loop, channel_name, username, message_id, posted_at,
+                               text, late=True)
 
 
 async def healthcheck_ping(loop: asyncio.AbstractEventLoop) -> None:
@@ -242,7 +259,10 @@ async def main():
         # A post the classifier never judged is parked, not discarded. Logging
         # it NO here would be recording a verdict nobody reached.
         if reason.startswith("LLM error:"):
-            await loop.run_in_executor(None, park_post, channel_name, text)
+            await loop.run_in_executor(
+                None, park_post, channel_name, username, event.id,
+                event.message.date, text
+            )
             print(f"[PARK] [{channel_name}] classifier unavailable — parked for retry | {preview}")
             return
 
@@ -254,36 +274,8 @@ async def main():
         if not decision:
             return
 
-        if is_duplicate(text):
-            print(f"[DUP ] [{channel_name}] skipping notification — seen in last 24h")
-            return
-
-        mark_seen(text)
-        try:
-            await loop.run_in_executor(
-                None,
-                lambda: send_notification(
-                    channel_name,
-                    username,
-                    event.id,
-                    event.message.date,
-                    text,
-                ),
-            )
-            print(f"[SENT] [{channel_name}] notification delivered")
-        except Exception as e:
-            print(f"[ERR ] [{channel_name}] notification failed: {e}")
-            try:
-                await loop.run_in_executor(
-                    None,
-                    send_alert,
-                    f"⚠️ <b>Update may be missed</b> — publish failed for "
-                    f"{html.escape(channel_name)}.\n\n"
-                    f'<a href="{html.escape(f"https://t.me/{username}/{event.id}")}">Read it directly →</a>\n\n'
-                    f"Monitoring continues normally.",
-                )
-            except Exception as alert_error:
-                print(f"[ERR ] alert delivery also failed: {alert_error}")
+        await _publish(loop, channel_name, username, event.id,
+                       event.message.date, text)
 
     await client.run_until_disconnected()
 
