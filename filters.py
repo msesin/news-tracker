@@ -30,7 +30,7 @@ _MODELS = (
     "gemini-3.8-flash",
 )
 _client = genai.Client(api_key=LLM_API_KEY)
-print(f"[LLM] key={LLM_API_KEY[:8]}… models={' → '.join(_MODELS)}")
+print(f"[LLM] models={' → '.join(_MODELS)}")
 
 # Rate limiter: free tier = 15 RPM; 5 s gap → 12 RPM to avoid edge-of-window 429s
 _lock = threading.Lock()
